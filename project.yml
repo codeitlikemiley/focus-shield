@@ -1,0 +1,70 @@
+name: FocusShield
+options:
+  bundleIdPrefix: com.focusshield
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: 1
+
+targets:
+  # ── macOS App ───────────────────────────────────────────────
+  FocusShield-macOS:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+        excludes:
+          - "iOS/**"
+    settings:
+      base:
+        PRODUCT_NAME: Focus Shield
+        PRODUCT_BUNDLE_IDENTIFIER: com.focusshield.macos
+        INFOPLIST_FILE: Platforms/macOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Platforms/macOS/FocusShield.entitlements
+        ENABLE_HARDENED_RUNTIME: true
+
+  # ── iOS App ─────────────────────────────────────────────────
+  FocusShield-iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+        excludes:
+          - "iOS/**"
+          - "Services/HostsFileService.swift"
+          - "Services/AppMonitorService.swift"
+          - "FocusShieldApp.swift"
+          - "Views/**"
+      - path: Sources/iOS
+    settings:
+      base:
+        PRODUCT_NAME: Focus Shield
+        PRODUCT_BUNDLE_IDENTIFIER: com.focusshield.ios
+        INFOPLIST_FILE: Platforms/iOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Platforms/iOS/FocusShield.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+schemes:
+  FocusShield-macOS:
+    build:
+      targets:
+        FocusShield-macOS: all
+    run:
+      config: Debug
+  FocusShield-iOS:
+    build:
+      targets:
+        FocusShield-iOS: all
+    run:
+      config: Debug
+      simulateLocation: false
