@@ -177,6 +177,22 @@ final class DataStore: @unchecked Sendable {
                 """
             )
         }
+        migrator.registerMigration("v11_add_site_list_visibility") { db in
+            let cols = try db.columns(in: "site_lists").map { $0.name }
+            if !cols.contains("isVisible") {
+                try db.alter(table: "site_lists") { t in
+                    t.add(column: "isVisible", .boolean).notNull().defaults(to: true)
+                }
+            }
+        }
+        migrator.registerMigration("v12_add_site_list_domain_enabled") { db in
+            let cols = try db.columns(in: "site_list_domains").map { $0.name }
+            if !cols.contains("isEnabled") {
+                try db.alter(table: "site_list_domains") { t in
+                    t.add(column: "isEnabled", .boolean).notNull().defaults(to: true)
+                }
+            }
+        }
         try migrator.migrate(q)
         return q
     }
@@ -354,6 +370,24 @@ final class DataStore: @unchecked Sendable {
         _ = try? dbQueue.write { db in try SiteList.deleteOne(db, key: id) }
     }
 
+    func renameSiteList(id: Int64, name: String) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE site_lists SET name = ? WHERE id = ?",
+                arguments: [name, id]
+            )
+        }
+    }
+
+    func toggleSiteListVisibility(id: Int64, isVisible: Bool) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE site_lists SET isVisible = ? WHERE id = ?",
+                arguments: [isVisible, id]
+            )
+        }
+    }
+
     @discardableResult
     func saveSiteListDomain(_ domain: inout SiteListDomain) -> Int64 {
         (try? dbQueue.write { db in
@@ -364,6 +398,15 @@ final class DataStore: @unchecked Sendable {
 
     func deleteSiteListDomain(id: Int64) {
         _ = try? dbQueue.write { db in try SiteListDomain.deleteOne(db, key: id) }
+    }
+
+    func toggleSiteListDomainEnabled(id: Int64, isEnabled: Bool) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE site_list_domains SET isEnabled = ? WHERE id = ?",
+                arguments: [isEnabled, id]
+            )
+        }
     }
 
     func updateSiteListDomain(id: Int64, domain: String) {
@@ -641,6 +684,15 @@ final class DataStore: @unchecked Sendable {
         _ = try? dbQueue.write { db in
             try db.execute(sql: "UPDATE app_rules SET filterMode = ? WHERE id = ?",
                            arguments: [filterMode.rawValue, id])
+        }
+    }
+
+    func updateAppRule(id: Int64, name: String, bundleID: String) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE app_rules SET appName = ?, bundleIdentifier = ? WHERE id = ?",
+                arguments: [name, bundleID, id]
+            )
         }
     }
 

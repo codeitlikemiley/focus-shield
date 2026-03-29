@@ -502,14 +502,16 @@ struct SiteList: Identifiable, Codable, Hashable, FetchableRecord, MutablePersis
     var name: String
     var isBuiltIn: Bool
     var sortOrder: Int
+    var isVisible: Bool
 
     static let databaseTableName = "site_lists"
 
-    init(id: Int64? = nil, name: String, isBuiltIn: Bool = false, sortOrder: Int = 0) {
+    init(id: Int64? = nil, name: String, isBuiltIn: Bool = false, sortOrder: Int = 0, isVisible: Bool = true) {
         self.id = id
         self.name = name
         self.isBuiltIn = isBuiltIn
         self.sortOrder = sortOrder
+        self.isVisible = isVisible
     }
 
     mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
@@ -520,14 +522,16 @@ struct SiteListDomain: Identifiable, Codable, Hashable, FetchableRecord, Mutable
     var siteListID: Int64
     var domain: String
     var sortOrder: Int
+    var isEnabled: Bool
 
     static let databaseTableName = "site_list_domains"
 
-    init(id: Int64? = nil, siteListID: Int64, domain: String, sortOrder: Int = 0) {
+    init(id: Int64? = nil, siteListID: Int64, domain: String, sortOrder: Int = 0, isEnabled: Bool = true) {
         self.id = id
         self.siteListID = siteListID
         self.domain = domain
         self.sortOrder = sortOrder
+        self.isEnabled = isEnabled
     }
 
     mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }

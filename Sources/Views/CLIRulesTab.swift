@@ -51,7 +51,7 @@ struct CLIRulesTab: View {
                 Button {
                     showAddCLI = true
                 } label: {
-                    Image(systemName: "plus")
+                    Label("Add CLI", systemImage: "plus")
                 }
             }
         }
@@ -122,6 +122,7 @@ struct CLIRulesTab: View {
                 .padding(.leading, 16)
 
                 RuleDomainEditorView(
+                    profileID: profileID,
                     currentMode: activeMode,
                     displayedGroups: activeGroups,
                     whitelistCount: cliRule.domainCount(for: .whitelist),
@@ -130,14 +131,6 @@ struct CLIRulesTab: View {
                     onModeChange: { mode in
                         guard let id = ruleID else { return }
                         vm.setCLIFilterMode(profileID: profileID, id: id, filterMode: mode)
-                    },
-                    onImport: {
-                        guard let ruleID else { return }
-                        importSiteListRule = AppRuleImportTarget(
-                            ruleID: ruleID,
-                            title: cliRule.rule.appName,
-                            filterMode: activeMode
-                        )
                     },
                     onToggleRule: { id, isEnabled in
                         vm.toggleDomainRule(profileID: profileID, id: id, enabled: isEnabled)
@@ -148,6 +141,9 @@ struct CLIRulesTab: View {
                     },
                     onDeleteRule: { id in
                         vm.removeDomainRule(profileID: profileID, id: id)
+                    },
+                    onEditRule: { id, domain in
+                        vm.updateDomainRule(profileID: profileID, id: id, domain: domain)
                     },
                     onAddDomain: { domain, mode in
                         guard let ruleID else { return }
@@ -167,6 +163,14 @@ struct CLIRulesTab: View {
                 isExpanded: isExpanded,
                 onToggleExpand: {
                     expandedRuleID = isExpanded ? nil : ruleID
+                },
+                onImport: {
+                    guard let ruleID else { return }
+                    importSiteListRule = AppRuleImportTarget(
+                        ruleID: ruleID,
+                        title: cliRule.rule.appName,
+                        filterMode: activeMode
+                    )
                 }
             )
         }
@@ -193,15 +197,18 @@ struct CLIRuleHeaderRow: View {
     let cliRule: AppRuleWithDomains
     let isExpanded: Bool
     let onToggleExpand: () -> Void
+    let onImport: () -> Void
 
     private var isLinked: Bool { cliRule.rule.isEnabled }
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             Button(action: onToggleExpand) {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -266,6 +273,15 @@ struct CLIRuleHeaderRow: View {
                 .opacity(isLinked ? 1 : 0.4)
             }
 
+            Button("Import") {
+                onImport()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!isLinked)
+            .help("Import domains from a site list")
+            .opacity(isLinked ? 1 : 0.4)
+
             // Unlink / Link button
             Button {
                 if let id = cliRule.rule.id {
@@ -274,6 +290,8 @@ struct CLIRuleHeaderRow: View {
             } label: {
                 Image(systemName: isLinked ? "link" : "link.badge.plus")
                     .foregroundStyle(isLinked ? Color.secondary : Color.orange)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help(isLinked ? "Disable rule (keep domain lists)" : "Re-enable rule")
@@ -281,11 +299,60 @@ struct CLIRuleHeaderRow: View {
             Button(role: .destructive) {
                 if let id = cliRule.rule.id { vm.removeAppRule(profileID: profileID, id: id) }
             } label: {
-                Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
+                Image(systemName: "trash")
+                    .foregroundStyle(.red.opacity(0.7))
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
         }
         .opacity(isLinked ? 1 : 0.7)
+    }
+}
+
+// MARK: - PATH-based CLI resolver
+
+enum CLIPathResolver {
+    /// Searches each directory in $PATH for an executable named `name`.
+    /// Returns the first match, or nil if not found.
+    static func resolve(_ name: String) -> String? {
+        guard !name.isEmpty, !name.hasPrefix("/") else { return nil }
+        let fm = FileManager.default
+        let pathDirs = ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":")
+            .map(String.init) ?? ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+        for dir in pathDirs {
+            let candidate = (dir as NSString).appendingPathComponent(name)
+            if fm.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// Scans PATH directories and returns all executables matching the prefix.
+    /// Used for building the suggestion list from real installed tools.
+    static func search(prefix: String, limit: Int = 12) -> [(name: String, path: String)] {
+        guard !prefix.isEmpty else { return [] }
+        let fm = FileManager.default
+        let pathDirs = ProcessInfo.processInfo.environment["PATH"]?
+            .split(separator: ":")
+            .map(String.init) ?? ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+        var seen = Set<String>()
+        var results: [(String, String)] = []
+        for dir in pathDirs {
+            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for entry in entries.sorted() {
+                guard entry.lowercased().hasPrefix(prefix.lowercased()) else { continue }
+                guard !seen.contains(entry) else { continue }
+                let full = (dir as NSString).appendingPathComponent(entry)
+                guard fm.isExecutableFile(atPath: full) else { continue }
+                seen.insert(entry)
+                results.append((entry, full))
+                if results.count >= limit { return results }
+            }
+        }
+        return results
     }
 }
 
@@ -296,59 +363,159 @@ struct AddCLIRuleSheet: View {
     @Environment(\.dismiss) private var dismiss
     let profileID: Int64
 
-    @State private var selectedPreset: DefaultApps.AppTemplate? = nil
-    @State private var customName = ""
-    @State private var customPath = ""
+    @State private var query = ""
     @State private var isBlocked = false
     @State private var filterMode: FilterMode = .blacklist
-    @State private var mode: SheetMode = .presets
+    @State private var showSuggestions = false
+    @FocusState private var fieldFocused: Bool
 
-    enum SheetMode { case presets, custom }
+    // PATH-resolved results
+    @State private var pathSuggestions: [(name: String, path: String)] = []
+    @State private var resolvedPath: String? = nil   // nil = not found, "" = resolving
+    @State private var isResolving = false
+
+
+    // ── What will be added ────────────────────────────────────────────
+    private var finalName: String {
+        let t = query.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("/") { return URL(fileURLWithPath: t).lastPathComponent }
+        return t
+    }
+
+    private var finalPath: String {
+        let t = query.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("/") { return t }                 // user typed an absolute path
+        return resolvedPath ?? t                         // PATH result, or bare name as fallback
+    }
+
+    private var isAddDisabled: Bool {
+        finalName.isEmpty || isResolving
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                Picker("Mode", selection: $mode) {
-                    Text("From Presets").tag(SheetMode.presets)
-                    Text("Custom").tag(SheetMode.custom)
-                }
-                .pickerStyle(.segmented)
-                .listRowBackground(Color.clear)
+                // ── Combobox ──────────────────────────────────────────
+                Section {
+                    VStack(alignment: .leading, spacing: 0) {
 
-                if mode == .presets {
-                    Section("Common CLI Tools") {
-                        ForEach(DefaultApps.cli, id: \.bundleID) { preset in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(preset.name)
-                                        .font(.system(.body, design: .monospaced))
-                                    Text(preset.executablePath ?? "")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundStyle(.secondary)
+                        // Input row
+                        HStack(alignment: .center, spacing: 8) {
+                            Image(systemName: "terminal")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 16)
+
+                            TextField("Command", text: $query)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 13, design: .monospaced))
+                                .focused($fieldFocused)
+                                .onChange(of: query) { _, newVal in
+                                    scheduleResolve(newVal)
                                 }
-                                Spacer()
-                                if selectedPreset?.bundleID == preset.bundleID {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(Color.accentColor)
+                                .autocorrectionDisabled()
+
+                            if isResolving {
+                                ProgressView().controlSize(.small)
+                                    .frame(width: 16, height: 16)
+                            } else if !query.isEmpty {
+                                Button { query = ""; pathSuggestions = []; resolvedPath = nil } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 16, height: 16)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .frame(minHeight: 36)
+                        .padding(.horizontal, 2)
+
+                        // Live PATH suggestions dropdown
+                        if showSuggestions && !pathSuggestions.isEmpty {
+                            Divider()
+                            ScrollView {
+                                VStack(spacing: 0) {
+                                    ForEach(pathSuggestions, id: \.path) { suggestion in
+                                        Button {
+                                            query = suggestion.name
+                                            resolvedPath = suggestion.path
+                                            showSuggestions = false
+                                            fieldFocused = false
+                                        } label: {
+                                            HStack(spacing: 10) {
+                                                Image(systemName: "terminal.fill")
+                                                    .foregroundStyle(.purple)
+                                                    .frame(width: 16)
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(suggestion.name)
+                                                        .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                                        .foregroundStyle(.primary)
+                                                    Text(suggestion.path)
+                                                        .font(.system(size: 11, design: .monospaced))
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                Spacer()
+                                                Image(systemName: "arrow.up.left")
+                                                    .font(.system(size: 10))
+                                                    .foregroundStyle(.tertiary)
+                                            }
+                                            .padding(.vertical, 7)
+                                            .padding(.horizontal, 4)
+                                            .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+                                        .background(Color.secondary.opacity(0.001))
+
+                                        if suggestion.path != pathSuggestions.last?.path {
+                                            Divider().padding(.leading, 30)
+                                        }
+                                    }
                                 }
                             }
-                            .contentShape(Rectangle())
-                            .onTapGesture { selectedPreset = preset }
+                            .frame(maxHeight: 220)
+                            .background(Color(nsColor: .controlBackgroundColor))
+                        }
+
+                        // Resolution preview
+                        if !query.trimmingCharacters(in: .whitespaces).isEmpty {
+                            Divider()
+                            HStack(spacing: 6) {
+                                let path = finalPath
+                                let isAbsolute = query.hasPrefix("/")
+                                let found = isAbsolute
+                                    ? FileManager.default.isExecutableFile(atPath: path)
+                                    : (resolvedPath != nil)
+
+                                Image(systemName: found ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(found ? .green : .orange)
+                                    .font(.system(size: 11))
+
+                                if found {
+                                    Text("\(finalName)  →  \(path)")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                } else if !isResolving {
+                                    Text("\"\(finalName)\" not found in PATH — will save name only")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 2)
                         }
                     }
-                } else {
-                    Section("Custom CLI Tool") {
-                        TextField("Name (e.g. mycli)", text: $customName)
-                        TextField("Executable path (e.g. /usr/local/bin/mycli)", text: $customPath)
-                    }
+                } header: {
+                    Label("CLI Tool", systemImage: "terminal")
+                } footer: {
+                    Text("Type a command name to search your PATH, or paste an absolute path like /usr/local/bin/mycli.")
                 }
 
+                // ── Settings ──────────────────────────────────────────
                 Section("Settings") {
                     Toggle("Block all outbound traffic", isOn: $isBlocked)
                     if !isBlocked {
                         Picker("Filter Mode", selection: $filterMode) {
-                            ForEach(FilterMode.directModes, id: \.self) { mode in
-                                Text(mode.label).tag(mode)
+                            ForEach(FilterMode.directModes, id: \.self) { m in
+                                Text(m.label).tag(m)
                             }
                         }
                     }
@@ -362,34 +529,64 @@ struct AddCLIRuleSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Add") {
-                        if mode == .presets, let preset = selectedPreset {
-                            vm.addCLIRule(
-                                profileID: profileID,
-                                name: preset.name,
-                                executablePath: preset.executablePath ?? customPath,
-                                blocked: isBlocked,
-                                filterMode: filterMode
-                            )
-                        } else {
-                            vm.addCLIRule(
-                                profileID: profileID,
-                                name: customName,
-                                executablePath: customPath,
-                                blocked: isBlocked,
-                                filterMode: filterMode
-                            )
-                        }
+                        vm.addCLIRule(
+                            profileID: profileID,
+                            name: finalName,
+                            executablePath: finalPath,
+                            blocked: isBlocked,
+                            filterMode: filterMode
+                        )
                         dismiss()
                     }
+                    .buttonStyle(.borderedProminent)
                     .disabled(isAddDisabled)
                 }
             }
         }
-        .frame(minWidth: 420, minHeight: 500)
+        .frame(minWidth: 420)
+        .frame(maxHeight: 500)
+        .onAppear { fieldFocused = true }
     }
 
-    private var isAddDisabled: Bool {
-        if mode == .presets { return selectedPreset == nil }
-        return customName.isEmpty || customPath.isEmpty
+    // ── PATH resolution ───────────────────────────────────────────────
+
+    private func scheduleResolve(_ newVal: String) {
+        let trimmed = newVal.trimmingCharacters(in: .whitespaces)
+
+        // Absolute path typed — no lookup needed, validate existence
+        if trimmed.hasPrefix("/") {
+            resolvedPath = trimmed
+            pathSuggestions = []
+            showSuggestions = false
+            return
+        }
+
+        pathSuggestions = []
+        resolvedPath = nil
+
+        guard !trimmed.isEmpty else {
+            showSuggestions = false
+            return
+        }
+
+        isResolving = true
+        showSuggestions = true
+
+        // Debounced async PATH scan (150 ms)
+        Task {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+
+            let suggestions = CLIPathResolver.search(prefix: trimmed)
+            let exact = CLIPathResolver.resolve(trimmed)
+
+            await MainActor.run {
+                pathSuggestions = suggestions
+                resolvedPath = exact
+                isResolving = false
+                showSuggestions = !suggestions.isEmpty
+            }
+        }
     }
 }
+

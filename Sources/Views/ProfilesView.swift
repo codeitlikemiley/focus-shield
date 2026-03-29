@@ -83,6 +83,10 @@ struct ProfileEditorSheet: View {
             }
         }
         .frame(minWidth: 380, minHeight: 500)
+        .onDisappear {
+            // Close the system color picker if it was opened via ColorPicker
+            NSColorPanel.shared.close()
+        }
     }
 
     private func saveProfile() {

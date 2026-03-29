@@ -8,14 +8,24 @@ struct GlobalRulesTab: View {
     @State private var expandedListIDs: Set<Int64> = []
     @State private var searchText = ""
     @State private var showAddList = false
-    @State private var addDomainForListID: Int64?
-    @State private var newDomain = ""
+
+    // Per-list new-domain input (keyed by list ID)
+    @State private var newDomainByListID: [Int64: String] = [:]
+
+    // Inline editing of a domain within a list
     @State private var editingDomainID: Int64?
     @State private var editingDomainText = ""
 
+    // Inline rename of a list header
+    @State private var renamingListID: Int64?
+    @State private var renamingListText = ""
+
+    // Delete confirmation
+    @State private var deleteListID: Int64?
+    @State private var showDeleteConfirm = false
+
     var filteredLists: [SiteListWithDomains] {
         guard !searchText.isEmpty else { return vm.siteLists }
-
         return vm.siteLists.compactMap { list in
             let matchesList = list.list.name.localizedCaseInsensitiveContains(searchText)
             let matchingDomains = list.domains.filter { $0.domain.localizedCaseInsensitiveContains(searchText) }
@@ -68,7 +78,18 @@ struct GlobalRulesTab: View {
         .sheet(isPresented: $showAddList) {
             AddSiteListSheet { newListID in
                 expandedListIDs.insert(newListID)
-                addDomainForListID = newListID
+            }
+        }
+        .alert("Delete List?", isPresented: $showDeleteConfirm, presenting: deleteListID) { id in
+            Button("Delete", role: .destructive) {
+                vm.removeSiteList(id: id)
+                expandedListIDs.remove(id)
+                newDomainByListID.removeValue(forKey: id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { id in
+            if let list = vm.siteLists.first(where: { $0.list.id == id }) {
+                Text("\"\(list.list.name)\" and all its domains will be permanently deleted.")
             }
         }
     }
@@ -95,152 +116,260 @@ struct GlobalRulesTab: View {
             ForEach(filteredLists, id: \.list.id) { siteList in
                 let listID = siteList.list.id ?? -1
                 let isExpanded = expandedListIDs.contains(listID)
-
                 Section {
                     if isExpanded {
-                        if siteList.domains.isEmpty, !siteList.list.isBuiltIn {
-                            HStack(alignment: .top, spacing: 8) {
-                                Image(systemName: "square.and.pencil")
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 18)
-                                Text("No domains yet. Add `facebook.com`, `m.facebook.com`, or `*.facebook.com` below.")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                            }
-                            .padding(.leading, 20)
-                        }
-
-                        ForEach(siteList.domains, id: \.id) { domain in
-                            let domainID = domain.id ?? -1
-                            if editingDomainID == domainID, !siteList.list.isBuiltIn {
-                                HStack(spacing: 8) {
-                                    Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 18)
-                                    TextField("Edit domain", text: $editingDomainText)
-                                        .textFieldStyle(.plain)
-                                        .font(.system(size: 13))
-                                        .onSubmit {
-                                            guard let id = domain.id else { return }
-                                            vm.updateSiteListDomain(id: id, domain: editingDomainText)
-                                            editingDomainID = nil
-                                            editingDomainText = ""
-                                        }
-                                    Button("Save") {
-                                        guard let id = domain.id else { return }
-                                        vm.updateSiteListDomain(id: id, domain: editingDomainText)
-                                        editingDomainID = nil
-                                        editingDomainText = ""
-                                    }
-                                    .buttonStyle(.plain)
-                                    Button("Cancel") {
-                                        editingDomainID = nil
-                                        editingDomainText = ""
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                                .padding(.leading, 20)
-                            } else {
-                                HStack(spacing: 8) {
-                                    Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 18)
-                                    Text(domain.domain)
-                                        .font(.system(size: 13))
-                                        .textSelection(.enabled)
-                                    Spacer()
-                                    if !siteList.list.isBuiltIn {
-                                        Button {
-                                            editingDomainID = domainID
-                                            editingDomainText = domain.domain
-                                        } label: {
-                                            Image(systemName: "pencil")
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        .buttonStyle(.plain)
-                                        Button(role: .destructive) {
-                                            guard let id = domain.id else { return }
-                                            vm.removeDomainFromSiteList(id: id)
-                                        } label: {
-                                            Image(systemName: "trash")
-                                                .foregroundStyle(.red.opacity(0.7))
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .padding(.leading, 20)
-                            }
-                        }
-
-                        if !siteList.list.isBuiltIn {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus.circle")
-                                    .foregroundStyle(Color.accentColor)
-                                    .frame(width: 18)
-                                TextField(
-                                    "Add facebook.com, m.facebook.com, or *.facebook.com",
-                                    text: Binding(
-                                        get: { addDomainForListID == listID ? newDomain : "" },
-                                        set: { newDomain = $0; addDomainForListID = listID }
-                                    )
-                                )
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 12))
-                                .onSubmit {
-                                    guard !newDomain.isEmpty else { return }
-                                    vm.addDomainToSiteList(siteListID: listID, domain: newDomain)
-                                    newDomain = ""
-                                    addDomainForListID = nil
-                                }
-                            }
-                            .padding(.leading, 20)
-                        }
+                        siteListExpandedContent(siteList: siteList, listID: listID)
                     }
                 } header: {
-                    HStack(spacing: 8) {
-                        Button {
-                            if isExpanded {
-                                expandedListIDs.remove(listID)
-                            } else {
-                                expandedListIDs.insert(listID)
-                            }
-                        } label: {
-                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text(siteList.list.name)
-                                    .font(.system(size: 13, weight: .semibold))
-                                Text("(\(siteList.domains.count))")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(siteList.list.isBuiltIn ? "Built-in list" : "Custom list")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Spacer()
-
-                        if !siteList.list.isBuiltIn {
-                            Button(role: .destructive) {
-                                vm.removeSiteList(id: listID)
-                            } label: {
-                                Image(systemName: "trash")
-                                    .foregroundStyle(.red.opacity(0.7))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
+                    listHeader(siteList: siteList, listID: listID, isExpanded: isExpanded)
                 }
             }
         }
         .listStyle(.inset)
+    }
+
+    @ViewBuilder
+    private func siteListExpandedContent(siteList: SiteListWithDomains, listID: Int64) -> some View {
+        if siteList.domains.isEmpty {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "square.and.pencil")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+                Text("No domains yet. Type a domain below and press Return.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.leading, 20)
+        }
+        ForEach(siteList.domains, id: \.id) { domain in
+            domainRow(domain: domain, listID: listID)
+        }
+        addDomainRow(siteList: siteList, listID: listID)
+    }
+
+    @ViewBuilder
+    private func domainRow(domain: SiteListDomain, listID: Int64) -> some View {
+        let domainID = domain.id ?? -1
+        if editingDomainID == domainID {
+            domainEditRow(domain: domain)
+        } else {
+            domainDisplayRow(domain: domain, domainID: domainID)
+        }
+    }
+
+    @ViewBuilder
+    private func domainEditRow(domain: SiteListDomain) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            TextField("Edit domain", text: $editingDomainText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .onSubmit { commitDomainEdit(domain: domain) }
+            Button("Save") { commitDomainEdit(domain: domain) }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+            Button("Cancel") {
+                editingDomainID = nil
+                editingDomainText = ""
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.leading, 20)
+    }
+
+    @ViewBuilder
+    private func domainDisplayRow(domain: SiteListDomain, domainID: Int64) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                guard let id = domain.id else { return }
+                vm.toggleSiteListDomainEnabled(id: id, isEnabled: !domain.isEnabled)
+            } label: {
+                Image(systemName: domain.isEnabled ? "eye" : "eye.slash")
+                    .foregroundStyle(domain.isEnabled ? Color.secondary : Color.orange)
+                    .frame(width: 18)
+            }
+            .buttonStyle(.plain)
+            .help(domain.isEnabled ? "Hide domain" : "Show domain")
+
+            Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                .foregroundStyle(domain.isEnabled ? Color.secondary : Color.secondary.opacity(0.4))
+                .frame(width: 14)
+
+            Text(domain.domain)
+                .font(.system(size: 13))
+                .foregroundStyle(domain.isEnabled ? Color.primary : Color.secondary)
+                .strikethrough(!domain.isEnabled, color: Color.secondary)
+                .textSelection(.enabled)
+
+            Spacer()
+
+            Button {
+                editingDomainID = domainID
+                editingDomainText = domain.domain
+            } label: {
+                Image(systemName: "pencil")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+
+            Button(role: .destructive) {
+                guard let id = domain.id else { return }
+                vm.removeDomainFromSiteList(id: id)
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(Color.red.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.leading, 20)
+    }
+
+    @ViewBuilder
+    private func addDomainRow(siteList: SiteListWithDomains, listID: Int64) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "plus.circle")
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 16)
+            TextField(
+                "Add \(siteList.list.name.lowercased()) domain, e.g. *.example.com",
+                text: Binding(
+                    get: { newDomainByListID[listID] ?? "" },
+                    set: { newDomainByListID[listID] = $0 }
+                )
+            )
+            .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .onSubmit {
+                let text = (newDomainByListID[listID] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return }
+                vm.addDomainToSiteList(siteListID: listID, domain: text)
+                newDomainByListID[listID] = ""
+            }
+        }
+        .padding(.leading, 32)
+    }
+
+    @ViewBuilder
+    private func listHeader(siteList: SiteListWithDomains, listID: Int64, isExpanded: Bool) -> some View {
+        HStack(spacing: 8) {
+            // Expand/collapse
+            Button {
+                if expandedListIDs.contains(listID) {
+                    expandedListIDs.remove(listID)
+                } else {
+                    expandedListIDs.insert(listID)
+                }
+            } label: {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+
+            // Name area — inline rename
+            if renamingListID == listID {
+                TextField("List name", text: $renamingListText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(maxWidth: 200)
+                    .onSubmit { commitRename(listID: listID) }
+                Button("Save") { commitRename(listID: listID) }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .font(.system(size: 12))
+                Button("Cancel") {
+                    renamingListID = nil
+                    renamingListText = ""
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .font(.system(size: 12))
+            } else {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(siteList.list.name)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(siteList.list.isVisible ? .primary : .secondary)
+                        Text("(\(siteList.domains.count))")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        if !siteList.list.isVisible {
+                            Text("Hidden")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                    Text(siteList.list.isBuiltIn ? "Built-in list" : "Custom list")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .onTapGesture(count: 2) {
+                    renamingListID = listID
+                    renamingListText = siteList.list.name
+                }
+            }
+
+            Spacer()
+
+            // Action buttons — ALL lists
+            if renamingListID != listID {
+                // Visibility eye toggle
+                Button {
+                    guard let id = siteList.list.id else { return }
+                    vm.toggleSiteListVisibility(id: id, isVisible: !siteList.list.isVisible)
+                } label: {
+                    Image(systemName: siteList.list.isVisible ? "eye" : "eye.slash")
+                        .foregroundStyle(siteList.list.isVisible ? Color.secondary : Color.orange)
+                }
+                .buttonStyle(.plain)
+                .help(siteList.list.isVisible ? "Hide from import picker" : "Show in import picker")
+
+                // Rename
+                Button {
+                    renamingListID = listID
+                    renamingListText = siteList.list.name
+                } label: {
+                    Image(systemName: "pencil")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Rename list")
+
+                // Delete
+                Button(role: .destructive) {
+                    deleteListID = listID
+                    showDeleteConfirm = true
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .help("Delete list and all its domains")
+            }
+        }
+    }
+
+    private func commitDomainEdit(domain: SiteListDomain) {
+        guard let id = domain.id else { return }
+        vm.updateSiteListDomain(id: id, domain: editingDomainText)
+        editingDomainID = nil
+        editingDomainText = ""
+    }
+
+    private func commitRename(listID: Int64) {
+        let name = renamingListText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            vm.renameSiteList(id: listID, name: name)
+        }
+        renamingListID = nil
+        renamingListText = ""
     }
 
     private var emptyState: some View {
@@ -271,22 +400,26 @@ struct AddSiteListSheet: View {
 
             TextField("e.g. Social Media", text: $name)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit { create() }
 
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
-                Button("Create") {
-                    if let id = vm.addSiteList(name: name) {
-                        onCreated(id)
-                    }
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Create") { create() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding()
         .frame(minWidth: 360)
+    }
+
+    private func create() {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if let id = vm.addSiteList(name: name) {
+            onCreated(id)
+        }
+        dismiss()
     }
 }
 

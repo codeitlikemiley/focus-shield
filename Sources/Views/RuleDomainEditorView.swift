@@ -1,19 +1,22 @@
 import SwiftUI
 
 struct RuleDomainEditorView: View {
+    let profileID: Int64
     let currentMode: FilterMode
     let displayedGroups: [DomainGroup]
     let whitelistCount: Int
     let blacklistCount: Int
     let addPlaceholder: String
     let onModeChange: (FilterMode) -> Void
-    let onImport: () -> Void
     let onToggleRule: (Int64, Bool) -> Void
     let onToggleAllRules: (Bool) -> Void
     let onDeleteRule: (Int64) -> Void
+    let onEditRule: (Int64, String) -> Void
     let onAddDomain: (String, FilterMode) -> Void
 
     @State private var newDomain = ""
+    @State private var editingRuleID: Int64?
+    @State private var editingDomainText = ""
 
     var body: some View {
         let allRules = displayedGroups.flatMap(\.rules)
@@ -21,6 +24,7 @@ struct RuleDomainEditorView: View {
         let allRulesEnabled = !allRules.isEmpty && enabledRuleCount == allRules.count
 
         Group {
+            // ── Header row: "Domain Filter" label + mode picker ──────────
             HStack {
                 Text("Domain Filter")
                     .font(.system(size: 12))
@@ -39,6 +43,7 @@ struct RuleDomainEditorView: View {
             }
             .padding(.leading, 16)
 
+            // ── Stats + All Sites toggle ──────────────────────────────────
             HStack {
                 Text("\(whitelistCount) whitelist · \(blacklistCount) blacklist saved")
                     .font(.system(size: 11))
@@ -68,16 +73,7 @@ struct RuleDomainEditorView: View {
             }
             .padding(.leading, 16)
 
-            HStack {
-                Text("Templates")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Import Site List…", action: onImport)
-                    .buttonStyle(.plain)
-            }
-            .padding(.leading, 16)
-
+            // ── Domain rows ───────────────────────────────────────────────
             if displayedGroups.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: currentMode == .whitelist ? "checkmark.shield" : "hand.raised")
@@ -106,37 +102,17 @@ struct RuleDomainEditorView: View {
                     }
 
                     ForEach(group.rules, id: \.id) { domainRule in
-                        HStack {
-                            Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
-                                .foregroundStyle(.secondary)
-                                .frame(width: 16)
-                            Text(domainRule.domain)
-                                .font(.system(size: 12))
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { domainRule.isEnabled },
-                                set: { isEnabled in
-                                    guard let id = domainRule.id else { return }
-                                    onToggleRule(id, isEnabled)
-                                }
-                            ))
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .labelsHidden()
-                            Button(role: .destructive) {
-                                guard let id = domainRule.id else { return }
-                                onDeleteRule(id)
-                            } label: {
-                                Image(systemName: "trash")
-                                    .foregroundStyle(.red.opacity(0.7))
-                            }
-                            .buttonStyle(.plain)
+                        let ruleID = domainRule.id ?? -1
+                        if editingRuleID == ruleID {
+                            domainEditRow(domainRule: domainRule, ruleID: ruleID)
+                        } else {
+                            domainDisplayRow(domainRule: domainRule, ruleID: ruleID)
                         }
-                        .padding(.leading, 32)
                     }
                 }
             }
 
+            // ── Add domain input ────────────────────────────────────────
             HStack {
                 Image(systemName: "plus.circle")
                     .foregroundStyle(Color.accentColor)
@@ -148,6 +124,90 @@ struct RuleDomainEditorView: View {
             }
             .padding(.leading, 32)
         }
+    }
+
+    // MARK: - Domain Display Row
+
+    @ViewBuilder
+    private func domainDisplayRow(domainRule: DomainRule, ruleID: Int64) -> some View {
+        HStack {
+            Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(domainRule.domain)
+                .font(.system(size: 12))
+            Spacer()
+
+            // Edit (pencil)
+            Button {
+                editingRuleID = ruleID
+                editingDomainText = domainRule.domain
+            } label: {
+                Image(systemName: "pencil")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Edit domain")
+
+            // Enable/disable toggle
+            Toggle("", isOn: Binding(
+                get: { domainRule.isEnabled },
+                set: { isEnabled in
+                    guard let id = domainRule.id else { return }
+                    onToggleRule(id, isEnabled)
+                }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .labelsHidden()
+
+            // Delete
+            Button(role: .destructive) {
+                guard let id = domainRule.id else { return }
+                onDeleteRule(id)
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(.red.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.leading, 32)
+    }
+
+    // MARK: - Domain Edit Row
+
+    @ViewBuilder
+    private func domainEditRow(domainRule: DomainRule, ruleID: Int64) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            TextField("Edit domain", text: $editingDomainText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .onSubmit { commitEdit(ruleID: ruleID) }
+            Button("Save") { commitEdit(ruleID: ruleID) }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .font(.system(size: 12))
+            Button("Cancel") {
+                editingRuleID = nil
+                editingDomainText = ""
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .font(.system(size: 12))
+        }
+        .padding(.leading, 32)
+    }
+
+    // MARK: - Helpers
+
+    private func commitEdit(ruleID: Int64) {
+        guard ruleID > 0 else { return }
+        onEditRule(ruleID, editingDomainText)
+        editingRuleID = nil
+        editingDomainText = ""
     }
 
     private func addDomain() {

@@ -278,6 +278,13 @@ final class FocusShieldViewModel {
         reloadSiteLists()
     }
 
+    func renameSiteList(id: Int64, name: String) {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else { return }
+        store.renameSiteList(id: id, name: cleanName)
+        reloadSiteLists()
+    }
+
     func addDomainToSiteList(siteListID: Int64, domain: String) {
         let clean = cleanDomain(domain)
         guard !clean.isEmpty else { return }
@@ -294,6 +301,16 @@ final class FocusShieldViewModel {
 
     func removeDomainFromSiteList(id: Int64) {
         store.deleteSiteListDomain(id: id)
+        reloadSiteLists()
+    }
+
+    func toggleSiteListVisibility(id: Int64, isVisible: Bool) {
+        store.toggleSiteListVisibility(id: id, isVisible: isVisible)
+        reloadSiteLists()
+    }
+
+    func toggleSiteListDomainEnabled(id: Int64, isEnabled: Bool) {
+        store.toggleSiteListDomainEnabled(id: id, isEnabled: isEnabled)
         reloadSiteLists()
     }
 
@@ -400,6 +417,13 @@ final class FocusShieldViewModel {
         }
     }
 
+    func updateDomainRule(profileID: Int64, id: Int64, domain: String) {
+        let cleaned = domain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        store.updateDomainRuleValue(id: id, domain: cleaned)
+        reloadAndApply(profileID: profileID)
+    }
+
     func changeDomainGroup(profileID: Int64, ruleID: Int64, newGroupID: Int64?) {
         store.updateDomainRuleGroup(id: ruleID, groupID: newGroupID)
         reloadAndApply(profileID: profileID)
@@ -422,6 +446,11 @@ final class FocusShieldViewModel {
         store.deleteAppRule(id: id)
         reloadAndApplyApp(profileID: profileID)
         if shouldPromptForBrowserRestart(appRule: appRule) { noteBrowserPolicyChange() }
+    }
+
+    func updateAppRule(profileID: Int64, id: Int64, name: String, bundleID: String) {
+        store.updateAppRule(id: id, name: name, bundleID: bundleID)
+        reloadAndApplyApp(profileID: profileID)
     }
 
     func toggleAppBlocked(profileID: Int64, id: Int64, blocked: Bool) {

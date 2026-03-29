@@ -11,6 +11,7 @@ struct AppRulesTab: View {
     @State private var showAddApp = false
     @State private var showBrowseApps = false
     @State private var importSiteListRule: AppRuleImportTarget?
+    @State private var editingRule: EditAppRuleTarget? = nil
 
     @State private var profileWithRules: ProfileWithRules?
 
@@ -109,7 +110,8 @@ struct AppRulesTab: View {
                     }
                     Button("Add Manually…") { showAddApp = true }
                 } label: {
-                    Image(systemName: "plus")
+                    Label("Add App", systemImage: "plus")
+                        .labelStyle(.titleAndIcon)
                 }
             }
         }
@@ -118,6 +120,9 @@ struct AppRulesTab: View {
         }
         .sheet(isPresented: $showAddApp) {
             AddAppSheet(profileID: profileID)
+        }
+        .sheet(item: $editingRule) { target in
+            EditAppSheet(profileID: profileID, rule: target.rule)
         }
         .sheet(item: $importSiteListRule) { target in
             ImportSiteListSheet(
@@ -175,6 +180,7 @@ struct AppRulesTab: View {
             if isExpanded {
                 if appRule.supportsPerAppDomainFiltering {
                     RuleDomainEditorView(
+                        profileID: profileID,
                         currentMode: activeMode,
                         displayedGroups: activeGroups,
                         whitelistCount: appRule.domainCount(for: .whitelist),
@@ -183,14 +189,6 @@ struct AppRulesTab: View {
                         onModeChange: { mode in
                             guard let id = ruleID else { return }
                             vm.setAppFilterMode(profileID: profileID, id: id, filterMode: mode)
-                        },
-                        onImport: {
-                            guard let ruleID else { return }
-                            importSiteListRule = AppRuleImportTarget(
-                                ruleID: ruleID,
-                                title: appRule.rule.appName,
-                                filterMode: activeMode
-                            )
                         },
                         onToggleRule: { id, isEnabled in
                             vm.toggleDomainRule(profileID: profileID, id: id, enabled: isEnabled)
@@ -201,6 +199,9 @@ struct AppRulesTab: View {
                         },
                         onDeleteRule: { id in
                             vm.removeDomainRule(profileID: profileID, id: id)
+                        },
+                        onEditRule: { id, domain in
+                            vm.updateDomainRule(profileID: profileID, id: id, domain: domain)
                         },
                         onAddDomain: { domain, mode in
                             guard let ruleID else { return }
@@ -231,6 +232,18 @@ struct AppRulesTab: View {
                 isExpanded: isExpanded,
                 onToggleExpand: {
                     expandedRuleID = isExpanded ? nil : ruleID
+                },
+                onEdit: {
+                    guard let id = appRule.rule.id else { return }
+                    editingRule = EditAppRuleTarget(id: id, rule: appRule.rule)
+                },
+                onImport: {
+                    guard let ruleID else { return }
+                    importSiteListRule = AppRuleImportTarget(
+                        ruleID: ruleID,
+                        title: appRule.rule.appName,
+                        filterMode: activeMode
+                    )
                 }
             )
         }
@@ -260,32 +273,44 @@ struct AppRuleHeaderRow: View {
     let appRule: AppRuleWithDomains
     let isExpanded: Bool
     let onToggleExpand: () -> Void
+    let onEdit: () -> Void
+    let onImport: () -> Void
 
     private var isLinked: Bool { appRule.rule.isEnabled }
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             Button(action: onToggleExpand) {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
             Image(systemName: "app.fill")
-                .foregroundStyle(isLinked ? (appRule.rule.isBlocked ? .red : .blue) : .gray)
+                .foregroundStyle(appRule.rule.isBlocked ? .red : .blue)
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(appRule.rule.appName)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(isLinked ? .primary : .secondary)
-                HStack(spacing: 4) {
+                // App name + Disabled badge on the same line
+                HStack(spacing: 6) {
+                    Text(appRule.rule.appName)
+                        .font(.system(size: 13, weight: .medium))
                     if !isLinked {
-                        Label("Disabled", systemImage: "link.badge.plus")
+                        Text("Disabled")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.orange)
-                    } else if appRule.rule.isBlocked {
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+                    }
+                }
+
+                // Sub-label row (status without Disabled — handled above)
+                HStack(spacing: 4) {
+                    if appRule.rule.isBlocked {
                         Label("Blocked", systemImage: "stop.circle.fill")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.red)
@@ -320,9 +345,7 @@ struct AppRuleHeaderRow: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .tint(.secondary)
-                .disabled(!isLinked)
                 .help("Unblock app")
-                .opacity(isLinked ? 1 : 0.4)
             } else {
                 Button("Block") {
                     if let id = appRule.rule.id {
@@ -332,31 +355,36 @@ struct AppRuleHeaderRow: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .tint(.red)
-                .disabled(!isLinked)
                 .help("Block app entirely")
-                .opacity(isLinked ? 1 : 0.4)
             }
 
-            // Unlink / Link button
-            Button {
-                if let id = appRule.rule.id {
-                    vm.toggleAppEnabled(profileID: profileID, id: id, enabled: !isLinked)
-                }
-            } label: {
-                Image(systemName: isLinked ? "link" : "link.badge.plus")
-                    .foregroundStyle(isLinked ? Color.secondary : Color.orange)
+            Button("Import") {
+                onImport()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Import domains from a site list")
+
+            // Edit name / bundle ID
+            Button(action: onEdit) {
+                Image(systemName: "pencil")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(isLinked ? "Disable rule (keep domain lists)" : "Re-enable rule")
+            .help("Edit app name and bundle ID")
 
             Button(role: .destructive) {
                 if let id = appRule.rule.id { vm.removeAppRule(profileID: profileID, id: id) }
             } label: {
-                Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
+                Image(systemName: "trash")
+                    .foregroundStyle(.red.opacity(0.7))
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
         }
-        .opacity(isLinked ? 1 : 0.7)
     }
 }
 
@@ -366,6 +394,11 @@ struct AppRuleImportTarget: Identifiable {
     let filterMode: FilterMode
 
     var id: Int64 { ruleID }
+}
+
+struct EditAppRuleTarget: Identifiable {
+    let id: Int64
+    let rule: AppRule
 }
 
 // MARK: - Browse Apps Sheet
@@ -439,5 +472,55 @@ struct AddAppSheet: View {
         }
         .padding()
         .frame(minWidth: 360)
+    }
+}
+
+// MARK: - Edit App Sheet
+
+struct EditAppSheet: View {
+    @Environment(FocusShieldViewModel.self) private var vm
+    @Environment(\.dismiss) private var dismiss
+    let profileID: Int64
+    let rule: AppRule
+
+    @State private var appName = ""
+    @State private var bundleID = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Edit App Rule")
+                .font(.title2.weight(.bold))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Display Name").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                TextField("App name", text: $appName).textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bundle Identifier").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                TextField("com.example.App", text: $bundleID)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13, design: .monospaced))
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Save") {
+                    if let id = rule.id {
+                        vm.updateAppRule(profileID: profileID, id: id, name: appName, bundleID: bundleID)
+                    }
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(appName.isEmpty || bundleID.isEmpty)
+            }
+        }
+        .padding()
+        .frame(minWidth: 360)
+        .onAppear {
+            appName = rule.appName
+            bundleID = rule.bundleIdentifier
+        }
     }
 }

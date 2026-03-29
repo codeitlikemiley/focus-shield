@@ -54,6 +54,9 @@ struct ProfileRowView: View {
     let profile: BlockProfile
     let isSelected: Bool
 
+    @State private var showEditor = false
+    @State private var showDeleteConfirm = false
+
     var isActive: Bool { vm.settings.activeProfileID == profile.id && vm.settings.masterEnabled }
 
     var color: Color {
@@ -84,6 +87,58 @@ struct ProfileRowView: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+        .contextMenu {
+            // Edit
+            Button {
+                showEditor = true
+            } label: {
+                Label("Edit Profile", systemImage: "pencil")
+            }
+
+            Divider()
+
+            // Activate / Deactivate
+            if isActive {
+                Button {
+                    vm.deactivateProfile()
+                } label: {
+                    Label("Deactivate", systemImage: "stop.circle")
+                }
+            } else if vm.settings.activeProfileID == profile.id {
+                // Active profile but master shield is off
+                Button {
+                    vm.masterEnabled = true
+                } label: {
+                    Label("Turn On Shield", systemImage: "shield.fill")
+                }
+            } else {
+                Button {
+                    if let id = profile.id { vm.activateProfile(id) }
+                } label: {
+                    Label("Activate", systemImage: "checkmark.circle")
+                }
+            }
+
+            Divider()
+
+            // Delete
+            Button(role: .destructive) {
+                showDeleteConfirm = true
+            } label: {
+                Label("Delete Profile", systemImage: "trash")
+            }
+        }
+        .sheet(isPresented: $showEditor) {
+            ProfileEditorSheet(profile: profile)
+        }
+        .alert("Delete \"\(profile.name)\"?", isPresented: $showDeleteConfirm) {
+            Button("Delete", role: .destructive) {
+                if let id = profile.id { vm.deleteProfile(id: id) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will permanently delete the profile and all its rules.")
+        }
     }
 
     private var activeChip: some View {
