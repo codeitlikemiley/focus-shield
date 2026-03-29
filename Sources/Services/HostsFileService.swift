@@ -1,28 +1,37 @@
 import Foundation
 
-/// Manages website blocking using a quad-layer approach:
+/// Manages the legacy host/proxy/firewall enforcement stack:
 ///
 /// 1. **`/etc/hosts`** — DNS-level blocking (Chrome, curl, native apps)
 /// 2. **`pf` firewall** — Network-level blocking (IP-based)
 /// 3. **PAC proxy file** — Proxy-level blocking (Chrome, Firefox)
-/// 4. **Local DNS proxy** — Intercepts ALL DNS including Safari's (THE FIX)
+/// 4. **Local DNS proxy** — Additional DNS enforcement for the legacy path
 ///
-/// Safari ignores /etc/hosts, pf, AND system proxy settings.
-/// The only reliable way to block Safari is to intercept DNS queries directly
-/// via a local DNS server on port 53.
+/// Safari / WebKit traffic should now be handled by the Network Extension path.
+/// This service remains responsible for Chrome/Firefox managed policy, CLI
+/// wrappers, hosts/pf, and the rest of the non-extension runtime.
 ///
 /// Authentication: uses a privileged helper installed once (no repeated passwords).
 enum HostsFileService {
     private static let startMarker = "# FocusShield START"
     private static let endMarker = "# FocusShield END"
+    private static let privateRelayBlockList = [
+        "mask.icloud.com",
+        "mask-h2.icloud.com",
+        "doh.dns.apple.com",
+        "mask.apple-dns.net",
+    ]
     private static let hostsPath = "/etc/hosts"
-    private static let pfAnchor = "com.focusshield"
     private static let pfRulesPath = "/etc/pf.anchors/com.focusshield"
     private static let helperPath = "/usr/local/bin/focusshield-helper"
     private static let sudoersPath = "/etc/sudoers.d/focusshield"
     private static let dnsProxyPath = "/usr/local/bin/focusshield-dns"
     private static let dnsPidPath = "/tmp/focusshield-dns.pid"
-    private static let dnsSudoersPath = "/etc/sudoers.d/focusshield-dns"
+    private static let supportScriptsDir = "/usr/local/lib/focusshield"
+    private static let aliasManagerPath = "\(supportScriptsDir)/update_aliases.sh"
+    private static let payloadGuardPath = "\(supportScriptsDir)/focusshield-cli-guard"
+    private static let managedPreferencesDir = "/Library/Managed Preferences"
+    private static let firefoxManagedPolicyPath = "/Library/Application Support/Mozilla/managed-policies.json"
 
     /// PAC file path — stored in the app's support directory
     private static var pacFilePath: String {
@@ -47,59 +56,104 @@ enum HostsFileService {
         return dir.appendingPathComponent("original-dns.txt").path
     }
 
+    private static var runtimePayloadProtectionEnabled: Bool {
+        guard let content = try? String(contentsOfFile: PayloadProtectionService.patternsFilePath, encoding: .utf8) else {
+            return false
+        }
+        return content.split(whereSeparator: \.isNewline).isEmpty == false
+    }
+
     // MARK: - Public API
 
     /// Primary enforcement entry-point: applies a full ProfileNetworkPolicy across all layers.
     static func applyNetworkPolicy(_ policy: ProfileNetworkPolicy) async throws {
-        // 1. Compute the flat global domain list
         let globalDomains = policy.globalDomains
+        let browserOverrides = policy.appDomainOverrides.filter {
+            AppNetworkSupport.supportsLegacyBrowserPolicy(bundleID: $0.bundleID)
+        }
+        let safariNeedsRelayBypass = browserOverrides.contains { $0.bundleID == "com.apple.Safari" }
+        let relayBypassDomains = safariNeedsRelayBypass ? privateRelayBlockList : []
 
-        // 2. Build pf rules: global + per-CLI
         let pfRules = buildCombinedPfRules(
             globalDomains: globalDomains,
             globalMode: policy.globalMode,
-            cliRules: policy.cliRules
+            cliRules: policy.cliRules,
+            forcedBlockDomains: relayBypassDomains
         )
 
-        // 3. Build PAC with per-app overrides
-        let pacContent: String
+        let globalPAC: String
         if policy.globalMode == .whitelist {
-            // Whitelist PAC: block everything except allowed domains (+ per-app exceptions)
-            pacContent = buildWhitelistPacFile(
-                globalAllowed: globalDomains,
-                appOverrides: policy.appDomainOverrides
-            )
+            globalPAC = buildWhitelistPacFile(globalAllowed: globalDomains, appOverrides: [])
         } else {
-            // Blacklist PAC: block listed domains, allow everything else
-            pacContent = buildPacFile(for: globalDomains)
+            globalPAC = buildBlacklistPacFile(globalDomains: globalDomains, appOverrides: [])
         }
 
-        // 4. Hosts file (blacklist only — whitelist is handled by DNS proxy)
+        var appPACs: [String: String] = [:]
+        for override in browserOverrides {
+            appPACs[override.bundleID] = buildBrowserPacFile(
+                globalDomains: globalDomains,
+                globalMode: policy.globalMode,
+                override: override
+            )
+        }
+
+        var cliPACs: [String: String] = [:]
+        for cliRule in policy.cliRules where !cliRule.isFullyBlocked && !cliRule.domains.isEmpty {
+            let toolName = (cliRule.executablePath as NSString).lastPathComponent
+            cliPACs[toolName] = buildBrowserPacFile(
+                globalDomains: globalDomains,
+                globalMode: policy.globalMode,
+                override: ProfileNetworkPolicy.AppDomainOverride(
+                    bundleID: toolName,
+                    filterMode: cliRule.filterMode,
+                    domains: cliRule.domains
+                )
+            )
+        }
+
+        let systemPAC = appPACs["com.apple.Safari"] ?? globalPAC
+        let shouldEnableSystemProxy = policy.globalMode == .whitelist
+            || !globalDomains.isEmpty
+            || appPACs["com.apple.Safari"] != nil
+
         let currentContent = (try? String(contentsOfFile: hostsPath, encoding: .utf8)) ?? ""
         var newHostsContent = removeExistingEntries(from: currentContent)
         if !newHostsContent.hasSuffix("\n") { newHostsContent += "\n" }
 
-        if policy.globalMode == .blacklist && !globalDomains.isEmpty {
+        let staticBlockedDomains = relayBypassDomains + (
+            policy.globalMode == .blacklist ? expandedDomainsForStaticResolvers(globalDomains) : []
+        )
+        if !staticBlockedDomains.isEmpty {
             newHostsContent += "\(startMarker)\n"
-            for domain in globalDomains {
+            for domain in staticBlockedDomains {
                 newHostsContent += "127.0.0.1 \(domain)\n"
+                newHostsContent += "::1 \(domain)\n"
             }
             newHostsContent += "\(endMarker)\n"
         }
 
-        // 5. Write domains file for DNS proxy
         let domainsListContent = globalDomains.joined(separator: "\n")
         try domainsListContent.write(toFile: domainsFilePath, atomically: true, encoding: .utf8)
 
-        // 6. Write + start PAC
-        try pacContent.write(toFile: pacFilePath, atomically: true, encoding: .utf8)
-        PACServer.shared.start(with: pacContent)
+        try systemPAC.write(toFile: pacFilePath, atomically: true, encoding: .utf8)
+        PACServer.shared.updateAll(globalPAC: systemPAC, appPACs: appPACs, cliPACs: cliPACs)
 
-        // 7. Apply privileged operations
-        try await applyBlocking(hostsContent: newHostsContent, pfRules: pfRules,
-                                domains: globalDomains)
+        let browserPoliciesDir = buildBrowserPolicies(appPACs: appPACs)
 
-        // 8. Start DNS proxy
+        let wrappersDir = buildCLIWrappers(
+            cliRules: policy.cliRules,
+            cliPACs: cliPACs,
+            payloadProtectionEnabled: runtimePayloadProtectionEnabled
+        )
+
+        try await applyBlocking(
+            hostsContent: newHostsContent,
+            pfRules: pfRules,
+            systemProxyURL: shouldEnableSystemProxy ? PACServer.proxyURL : nil,
+            wrappersDir: wrappersDir,
+            browserPoliciesDir: browserPoliciesDir
+        )
+
         if !globalDomains.isEmpty {
             try await startDNSProxy(mode: policy.globalMode)
         }
@@ -121,7 +175,7 @@ enum HostsFileService {
         // In whitelist mode, skip hosts (DNS proxy handles it)
         if mode == .blacklist && !domains.isEmpty {
             newHostsContent += "\(startMarker)\n"
-            for domain in domains {
+            for domain in expandedDomainsForStaticResolvers(domains) {
                 newHostsContent += "127.0.0.1 \(domain)\n"
             }
             newHostsContent += "\(endMarker)\n"
@@ -146,7 +200,12 @@ enum HostsFileService {
         try domainsListContent.write(toFile: domainsFilePath, atomically: true, encoding: .utf8)
 
         // 5. Apply privileged operations (hosts + pf + proxy + DNS)
-        try await applyBlocking(hostsContent: newHostsContent, pfRules: pfRules, domains: domains)
+        try await applyBlocking(
+            hostsContent: newHostsContent,
+            pfRules: pfRules,
+            systemProxyURL: !domains.isEmpty ? PACServer.proxyURL : nil,
+            wrappersDir: nil
+        )
 
         // 6. Start DNS proxy (after helper sets system DNS)
         if !domains.isEmpty {
@@ -159,25 +218,66 @@ enum HostsFileService {
         let currentContent = try String(contentsOfFile: hostsPath, encoding: .utf8)
         let cleanedContent = removeExistingEntries(from: currentContent)
 
-        // Update PAC to allow everything
         let emptyPac = "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n"
         try emptyPac.write(toFile: pacFilePath, atomically: true, encoding: .utf8)
-        PACServer.shared.updateContent(emptyPac)
+        PACServer.shared.updateAll(globalPAC: emptyPac, appPACs: [:], cliPACs: [:])
 
-        // Stop DNS proxy first (restores original DNS)
         try await stopDNSProxy()
 
-        // Clear domains file
         try "".write(toFile: domainsFilePath, atomically: true, encoding: .utf8)
 
-        try await applyBlocking(hostsContent: cleanedContent, pfRules: "# FocusShield - no rules active\n", domains: [])
+        try await applyBlocking(
+            hostsContent: cleanedContent,
+            pfRules: "# FocusShield - no rules active\n",
+            systemProxyURL: nil,
+            wrappersDir: nil,
+            browserPoliciesDir: nil
+        )
     }
 
     // MARK: - Helper Installation
 
     static var isHelperInstalled: Bool {
         FileManager.default.fileExists(atPath: helperPath) &&
-        FileManager.default.fileExists(atPath: sudoersPath)
+        FileManager.default.fileExists(atPath: sudoersPath) &&
+        FileManager.default.fileExists(atPath: aliasManagerPath) &&
+        FileManager.default.fileExists(atPath: payloadGuardPath) &&
+        ((try? String(contentsOfFile: helperPath, encoding: .utf8).contains("FocusShield privileged helper v5")) ?? false)
+    }
+
+    // MARK: - Runtime Health Checks
+
+    /// Checks that the PAC file contains actual blocking rules, not just DIRECT passthrough.
+    static func checkPACFileHealth() -> Bool {
+        guard let content = try? String(contentsOfFile: pacFilePath, encoding: .utf8) else {
+            return false
+        }
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A healthy PAC has blocking rules; a broken one is either empty or just returns DIRECT.
+        if trimmed.isEmpty { return false }
+        if trimmed == "function FindProxyForURL(url, host) { return \"DIRECT\"; }" { return false }
+        return trimmed.contains("PROXY 127.0.0.1:9") || trimmed.contains("BLOCKED")
+    }
+
+    /// Checks that macOS system proxy auto-config is enabled via scutil.
+    static func checkSystemProxyEnabled() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/scutil")
+        process.arguments = ["--proxy"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Look for ProxyAutoConfigEnable : 1
+        return output.contains("ProxyAutoConfigEnable : 1")
+    }
+
+    /// Checks that a Chromium managed policy plist exists for the given browser bundle ID.
+    static func checkManagedPolicyPresent(bundleID: String) -> Bool {
+        let path = "\(managedPreferencesDir)/\(bundleID).plist"
+        return FileManager.default.fileExists(atPath: path)
     }
 
     // MARK: - PAC File Generation (public for startup)
@@ -188,49 +288,227 @@ enum HostsFileService {
         return buildPacFile(for: domains)
     }
 
+    // MARK: - Per-Browser PAC generation
+
+    /// Generates a PAC tailored for a specific browser based on its per-app domain override.
+    private static func buildBrowserPacFile(
+        globalDomains: [String],
+        globalMode: FilterMode,
+        override: ProfileNetworkPolicy.AppDomainOverride
+    ) -> String {
+        switch override.filterMode {
+        case .inheritGlobal:
+            // No per-app config — use global rules
+            return globalMode == .whitelist
+                ? buildWhitelistPacFile(globalAllowed: globalDomains, appOverrides: [])
+                : buildBlacklistPacFile(globalDomains: globalDomains, appOverrides: [])
+
+        case .blacklist:
+            if override.domains.isEmpty {
+                // Empty blacklist = this browser is unrestricted (no domains to block via PAC)
+                return "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n"
+            }
+            // Block per-app domains + global domains additively
+            let combined = Array(Set(globalDomains + override.domains))
+            return buildBlacklistPacFile(globalDomains: combined, appOverrides: [])
+
+        case .whitelist:
+            // Whitelist: only allow specified domains, block everything else
+            return buildWhitelistPacFile(globalAllowed: override.domains, appOverrides: [])
+        }
+    }
+
+    // MARK: - CLI Wrapper Scripts
+
+    @discardableResult
+    private static func buildCLIWrappers(
+        cliRules: [ProfileNetworkPolicy.CLINetworkRule],
+        cliPACs: [String: String],
+        payloadProtectionEnabled: Bool
+    ) -> String? {
+        guard !cliRules.isEmpty else { return nil }
+
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("focusshield_wrappers_\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+
+        var wroteAny = false
+        for rule in cliRules {
+            let execPath = rule.executablePath
+            guard !execPath.isEmpty else { continue }
+
+            let toolName = (execPath as NSString).lastPathComponent
+            let encodedDomains = Data(rule.domains.joined(separator: "\n").utf8).base64EncodedString()
+            let hasDomainRules = !rule.domains.isEmpty
+            let needsGuard = payloadProtectionEnabled || hasDomainRules
+
+            let wrapperContent: String
+            if rule.isFullyBlocked {
+                wrapperContent = """
+#!/bin/sh
+# FocusShield: \(toolName) is blocked by the active profile.
+echo "focusshield: '\(toolName)' is blocked by the active FocusShield profile." >&2
+exit 1
+"""
+            } else if needsGuard {
+                let pacURL = cliPACs[toolName].map { _ in PACServer.cliPACURL(tool: toolName) } ?? ""
+                wrapperContent = """
+#!/bin/sh
+# FocusShield: \(toolName) request preflight wrapper.
+export FOCUSSHIELD_TOOL_NAME="\(toolName)"
+export FOCUSSHIELD_FILTER_MODE="\(rule.filterMode.rawValue)"
+export FOCUSSHIELD_DOMAIN_RULES_B64="\(encodedDomains)"
+export FOCUSSHIELD_PAYLOAD_PROTECTION="\(payloadProtectionEnabled ? "1" : "0")"
+export FOCUSSHIELD_PAYLOAD_PATTERNS_FILE="\(PayloadProtectionService.patternsFilePath)"
+export FOCUSSHIELD_PAYLOAD_ALLOWLIST_FILE="\(PayloadProtectionService.permanentAllowlistPath)"
+export FOCUSSHIELD_PAYLOAD_SESSION_ALLOWLIST_FILE="\(PayloadProtectionService.sessionAllowlistPath)"
+export FOCUSSHIELD_LEGACY_PAC_URL="\(pacURL)"
+
+if [ -x "\(payloadGuardPath)" ]; then
+    exec "\(payloadGuardPath)" "\(execPath)" "$@"
+fi
+
+exec "\(execPath)" "$@"
+"""
+            } else {
+                continue
+            }
+
+            let wrapperFile = tmpDir.appendingPathComponent(toolName)
+            if (try? wrapperContent.write(to: wrapperFile, atomically: true, encoding: .utf8)) != nil {
+                wroteAny = true
+            }
+        }
+
+        return wroteAny ? tmpDir.path : nil
+    }
+
+    @discardableResult
+    private static func buildBrowserPolicies(appPACs: [String: String]) -> String? {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("focusshield_browser_policies_\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+
+        var wroteAny = false
+        let chromiumTargets = AppNetworkSupport.chromiumManagedPolicyBundleIDs
+        for bundleID in chromiumTargets where appPACs[bundleID] != nil {
+            let plist = managedPlistPolicyContent(pacURL: PACServer.pacURL(bundleID: bundleID))
+            let target = tmpDir.appendingPathComponent("\(bundleID).plist")
+            if (try? plist.write(to: target, atomically: true, encoding: .utf8)) != nil {
+                wroteAny = true
+            }
+        }
+
+        if appPACs["org.mozilla.firefox"] != nil {
+            let json = firefoxManagedPolicyContent(pacURL: PACServer.pacURL(bundleID: "org.mozilla.firefox"))
+            let target = tmpDir.appendingPathComponent("org.mozilla.firefox.json")
+            if (try? json.write(to: target, atomically: true, encoding: .utf8)) != nil {
+                wroteAny = true
+            }
+        }
+
+        return wroteAny ? tmpDir.path : nil
+    }
+
+    private static func managedPlistPolicyContent(pacURL: String) -> String {
+        """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ProxySettings</key>
+    <dict>
+        <key>ProxyMode</key>
+        <string>pac_script</string>
+        <key>ProxyPacUrl</key>
+        <string>\(pacURL)</string>
+    </dict>
+</dict>
+</plist>
+"""
+    }
+
+    private static func firefoxManagedPolicyContent(pacURL: String) -> String {
+        """
+{
+  "policies": {
+    "ProxySettings": {
+      "ConnectionType": "autoConfig",
+      "AutoConfigURL": "\(pacURL)"
+    }
+  }
+}
+"""
+    }
+
     // MARK: - Private: PAC file
 
-    /// Generates a PAC (Proxy Auto-Config) file that routes blocked domains through a dead proxy.
-    /// Safari and all browsers respect system proxy settings, making this the most reliable approach.
+    /// Called by buildPacFileContent (public interface)
     private static func buildPacFile(for domains: [String]) -> String {
-        if domains.isEmpty {
+        buildBlacklistPacFile(globalDomains: domains, appOverrides: [])
+    }
+
+    /// Generates a blacklist PAC where per-app overrides can exempt apps from global rules.
+    /// Per-app Blacklist+empty = that app context bypasses the global deny list (all DIRECT via PAC).
+    /// Per-app Blacklist+domains = those domains are ALSO blocked (additive to global).
+    private static func buildBlacklistPacFile(
+        globalDomains: [String],
+        appOverrides: [ProfileNetworkPolicy.AppDomainOverride]
+    ) -> String {
+        // Check if any app override has Blacklist mode with EMPTY domain list.
+        // This means "that app (e.g. Safari) overrides the global list with nothing" → all DIRECT via PAC.
+        // Since PAC is global (can't target per-browser), the most permissive app override wins:
+        // any app demanding unrestricted access means the PAC won't block anything.
+        // (/etc/hosts and pf still block at network layer for non-browser apps.)
+        let hasUnrestrictedAppOverride = appOverrides.contains {
+            $0.filterMode == .blacklist && $0.domains.isEmpty
+        }
+        if hasUnrestrictedAppOverride {
             return "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n"
         }
 
-        // Build a fast lookup using a JS object
-        var domainList = ""
-        // Also extract base domains for subdomain matching
-        var baseDomains = Set<String>()
-        for domain in domains {
-            let escaped = domain.replacingOccurrences(of: "\"", with: "\\\"")
-            domainList += "    \"\(escaped)\": true,\n"
-
-            // Extract base domain (remove www., m., web., etc.)
-            let parts = domain.split(separator: ".")
-            if parts.count >= 2 {
-                let base = parts.suffix(2).joined(separator: ".")
-                baseDomains.insert(base)
+        // Compute the effective block list:
+        // Start with global, add any per-app blacklist domains, skip per-app whitelist domains.
+        var effectiveDomains = Set(globalDomains)
+        for override in appOverrides {
+            switch override.filterMode {
+            case .blacklist:
+                effectiveDomains.formUnion(override.domains) // additive
+            case .whitelist:
+                effectiveDomains.subtract(override.domains)  // exempted
+            case .inheritGlobal:
+                break
             }
         }
+
+        if effectiveDomains.isEmpty {
+            return "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n"
+        }
+
+        let domainList = pacDomainMapLiteral(Array(effectiveDomains))
 
         return """
         // FocusShield PAC — Auto-generated
         // Routes blocked domains through a dead proxy (127.0.0.1:9)
-        var BLOCKED = {
-        \(domainList)};
+        var BLOCKED = \(domainList);
 
         function FindProxyForURL(url, host) {
-            // Exact match
-            if (BLOCKED[host]) return "PROXY 127.0.0.1:9";
-
-            // Check if host ends with a blocked domain (subdomain matching)
+            host = host.toLowerCase();
             for (var domain in BLOCKED) {
-                if (host.length > domain.length &&
-                    host.substring(host.length - domain.length - 1) === "." + domain) {
+                if (host === domain ||
+                    (host.length > domain.length &&
+                     host.substring(host.length - domain.length - 1) === "." + domain)) {
                     return "PROXY 127.0.0.1:9";
                 }
             }
-
             return "DIRECT";
         }
 
@@ -243,27 +521,19 @@ enum HostsFileService {
         globalAllowed: [String],
         appOverrides: [ProfileNetworkPolicy.AppDomainOverride]
     ) -> String {
-        var lines = ""
-        for domain in globalAllowed {
-            let escaped = domain.replacingOccurrences(of: "\"", with: "\\\"")
-            lines += "    \"\(escaped)\": true,\n"
-        }
-        // System safelist always allowed
-        for domain in SystemSafelist.domains.sorted() {
-            let escaped = domain.replacingOccurrences(of: "\"", with: "\\\"")
-            lines += "    \"\(escaped)\": true,\n"
-        }
+        let allowedDomains = Array(Set(globalAllowed + Array(SystemSafelist.domains)))
+        let lines = pacDomainMapLiteral(allowedDomains)
 
         return """
         // FocusShield PAC — Whitelist mode
-        var ALLOWED = {
-        \(lines)};
+        var ALLOWED = \(lines);
 
         function FindProxyForURL(url, host) {
-            if (ALLOWED[host]) return "DIRECT";
+            host = host.toLowerCase();
             for (var domain in ALLOWED) {
-                if (host.length > domain.length &&
-                    host.substring(host.length - domain.length - 1) === "." + domain) {
+                if (host === domain ||
+                    (host.length > domain.length &&
+                     host.substring(host.length - domain.length - 1) === "." + domain)) {
                     return "DIRECT";
                 }
             }
@@ -274,50 +544,70 @@ enum HostsFileService {
         """
     }
 
-    /// Builds combined pf rules: global domain blocks/allows + per-CLI process rules.
-    private static func buildCombinedPfRules(
-        globalDomains: [String],
-        globalMode: FilterMode,
-        cliRules: [ProfileNetworkPolicy.CLINetworkRule]
-    ) -> String {
-        var rules = "# FocusShield pf rules — auto-generated\n"
-
-        // Global domain rules (blacklist mode only via pf)
-        if globalMode == .blacklist && !globalDomains.isEmpty {
-            rules += "# Global blacklist\n"
-            for domain in globalDomains {
-                rules += "block drop out quick on en0 proto tcp to \(domain) port { 80, 443 }\n"
-                rules += "block drop out quick on en1 proto tcp to \(domain) port { 80, 443 }\n"
-            }
+    private static func pacDomainMapLiteral(_ domains: [String]) -> String {
+        let normalized = normalizedMatchableDomains(domains)
+        guard !normalized.isEmpty else { return "{}" }
+        let map = Dictionary(uniqueKeysWithValues: normalized.map { ($0, true) })
+        guard let data = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{}"
         }
+        return json
+    }
 
-        // Per-CLI process rules (pf 'proc' keyword — macOS 14.4+)
-        for cliRule in cliRules {
-            let path = cliRule.executablePath
-            if cliRule.isFullyBlocked {
-                // Block ALL outbound for this executable
-                rules += "# CLI fully blocked: \(path)\n"
-                rules += "block drop out quick proto tcp proc \"\(path)\"\n"
-                rules += "block drop out quick proto udp proc \"\(path)\"\n"
-            } else if !cliRule.domains.isEmpty {
-                if cliRule.filterMode == .whitelist {
-                    // Block all except listed
-                    rules += "# CLI whitelist: \(path)\n"
-                    rules += "block drop out quick proto tcp proc \"\(path)\"\n"
-                    for domain in cliRule.domains {
-                        rules += "pass out quick proto tcp to \(domain) proc \"\(path)\"\n"
-                    }
-                } else {
-                    // Blacklist: block only listed
-                    rules += "# CLI blacklist: \(path)\n"
-                    for domain in cliRule.domains {
-                        rules += "block drop out quick proto tcp to \(domain) proc \"\(path)\"\n"
-                    }
+    private static func normalizedMatchableDomains(_ domains: [String]) -> [String] {
+        var seen = Set<String>()
+        return domains
+            .map { domain in
+                let trimmed = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return trimmed.hasPrefix("*.") ? String(trimmed.dropFirst(2)) : trimmed
+            }
+            .filter { !$0.isEmpty }
+            .filter { seen.insert($0).inserted }
+    }
+
+    private static func expandedDomainsForStaticResolvers(_ domains: [String]) -> [String] {
+        let commonPrefixes = [
+            "www", "m", "mobile", "web", "app", "api", "cdn", "static",
+            "touch", "connect", "graph", "video", "media", "edge",
+            "gateway", "images", "lookaside", "help", "support", "mail"
+        ]
+
+        var seen = Set<String>()
+        var expanded: [String] = []
+
+        for domain in normalizedMatchableDomains(domains) {
+            if seen.insert(domain).inserted {
+                expanded.append(domain)
+            }
+            for prefix in commonPrefixes {
+                let candidate = "\(prefix).\(domain)"
+                if seen.insert(candidate).inserted {
+                    expanded.append(candidate)
                 }
             }
         }
 
-        return rules
+        return expanded
+    }
+
+    /// Builds combined pf rules: global domain blocks/allows + per-CLI process rules.
+    /// Builds IP-resolved pf rules that block TCP, UDP (QUIC/HTTP3), AND ICMP for all blocked domains.
+    /// Resolves hostnames to IPs in Swift before pf loads them (pf can't do DNS reliably on macOS).
+    private static func buildCombinedPfRules(
+        globalDomains: [String],
+        globalMode: FilterMode,
+        cliRules: [ProfileNetworkPolicy.CLINetworkRule],
+        forcedBlockDomains: [String] = []
+    ) -> String {
+        // pf on macOS does NOT support per-process rules.
+        // CLI blocking is enforced via wrapper scripts (domain filter) and AppMonitorService (full block).
+        // pf handles IP-level blocking for all protocols for globally blocked domains and Safari relay bypass hosts.
+        let effectiveDomains = Array(Set(forcedBlockDomains + (globalMode == .blacklist ? globalDomains : [])))
+        guard !effectiveDomains.isEmpty else {
+            return "# FocusShield pf rules — no blacklist active\n"
+        }
+        return buildPfRules(for: effectiveDomains)
     }
 
 
@@ -349,15 +639,65 @@ enum HostsFileService {
 
     // MARK: - Private: pf rules
 
+    /// Resolve a hostname to all its IPv4 addresses
+    private static func resolveHostToIPs(_ host: String) -> [String] {
+        var results: [String] = []
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &res) == 0, let res = res else { return [] }
+        defer { freeaddrinfo(res) }
+        var ptr: UnsafeMutablePointer<addrinfo>? = res
+        while let cur = ptr {
+            if cur.pointee.ai_family == AF_INET,
+               let sockaddr = cur.pointee.ai_addr {
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                let sa = sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0 }
+                var addr = sa.pointee.sin_addr
+                inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN))
+                let ip = String(cString: buf)
+                if !ip.isEmpty && !results.contains(ip) { results.append(ip) }
+            }
+            ptr = cur.pointee.ai_next
+        }
+        return results
+    }
+
     private static func buildPfRules(for domains: [String]) -> String {
         var rules = "# FocusShield pf rules - auto-generated\n"
         if domains.isEmpty {
             rules += "# No domains to block\n"
-        } else {
-            rules += "# Block outgoing connections to blocked domains\n"
-            for domain in domains {
-                rules += "block drop out quick on en0 proto tcp to \(domain) port { 80, 443 }\n"
-                rules += "block drop out quick on en1 proto tcp to \(domain) port { 80, 443 }\n"
+            return rules
+        }
+        // Resolve hostnames to IPs. pf cannot do DNS and we need real IPs for blocking
+        // even when Safari uses Private Relay (which uses the real dest IPs through the relay).
+        var resolvedIPs = Set<String>()
+
+        // Also resolve Apple Private Relay ingress endpoints so pf blocks them directly.
+        // This forces Safari to fall back to direct mode where /etc/hosts and PAC take effect.
+        for relayHost in privateRelayBlockList {
+            resolvedIPs.formUnion(resolveHostToIPs(relayHost))
+        }
+
+        for domain in expandedDomainsForStaticResolvers(domains) {
+            resolvedIPs.formUnion(resolveHostToIPs(domain))
+        }
+
+        if resolvedIPs.isEmpty {
+            rules += "# No IPs resolved (DNS may be unavailable)\n"
+            return rules
+        }
+
+        rules += "# Block all outbound traffic to blocked IPs: TCP, UDP (QUIC/H3), ICMP (ping)\n"
+        rules += "# Private Relay ingress IPs also blocked to force Safari into direct mode.\n"
+        let interfaces = ["en0", "en1", "en2", "utun0", "utun1", "utun2"]
+        for ip in resolvedIPs.sorted() {
+            for iface in interfaces {
+                // Full TCP/UDP block covers HTTP/1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC
+                rules += "block drop out quick on \(iface) proto { tcp udp } to \(ip) port { 80 443 }\n"
+                // ICMP block prevents ping/traceroute to blocked IPs
+                rules += "block drop out quick on \(iface) proto icmp to \(ip)\n"
             }
         }
         return rules
@@ -365,7 +705,13 @@ enum HostsFileService {
 
     // MARK: - Private: Apply blocking
 
-    private static func applyBlocking(hostsContent: String, pfRules: String, domains: [String]) async throws {
+    private static func applyBlocking(
+        hostsContent: String,
+        pfRules: String,
+        systemProxyURL: String?,
+        wrappersDir: String? = nil,
+        browserPoliciesDir: String? = nil
+    ) async throws {
         let tmpHosts = FileManager.default.temporaryDirectory.appendingPathComponent("focusshield_hosts_\(UUID().uuidString)")
         let tmpPf = FileManager.default.temporaryDirectory.appendingPathComponent("focusshield_pf_\(UUID().uuidString)")
 
@@ -378,17 +724,37 @@ enum HostsFileService {
         }
 
         if isHelperInstalled {
-            try await runHelperDirectly(tmpHostsPath: tmpHosts.path, tmpPfPath: tmpPf.path, enableProxy: !domains.isEmpty)
+            try await runHelperDirectly(
+                tmpHostsPath: tmpHosts.path, tmpPfPath: tmpPf.path,
+                systemProxyURL: systemProxyURL, wrappersDir: wrappersDir, browserPoliciesDir: browserPoliciesDir
+            )
         } else {
-            try await installHelperAndApply(tmpHostsPath: tmpHosts.path, tmpPfPath: tmpPf.path, enableProxy: !domains.isEmpty)
+            try await installHelperAndApply(
+                tmpHostsPath: tmpHosts.path, tmpPfPath: tmpPf.path,
+                systemProxyURL: systemProxyURL, wrappersDir: wrappersDir, browserPoliciesDir: browserPoliciesDir
+            )
         }
     }
 
     /// Runs the helper via sudo (no password needed after initial install).
-    private static func runHelperDirectly(tmpHostsPath: String, tmpPfPath: String, enableProxy: Bool) async throws {
+    private static func runHelperDirectly(
+        tmpHostsPath: String,
+        tmpPfPath: String,
+        systemProxyURL: String?,
+        wrappersDir: String? = nil,
+        browserPoliciesDir: String? = nil
+    ) async throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = [helperPath, tmpHostsPath, tmpPfPath, enableProxy ? PACServer.proxyURL : "disable", enableProxy ? "enable" : "disable"]
+        let proxyArg = systemProxyURL ?? "disable"
+        let modeArg = systemProxyURL == nil ? "disable" : "enable"
+        var args: [String] = [helperPath, tmpHostsPath, tmpPfPath, proxyArg, modeArg]
+        if let wd = wrappersDir { args.append(wd) }
+        if let policyDir = browserPoliciesDir {
+            if wrappersDir == nil { args.append("") }
+            args.append(policyDir)
+        }
+        process.arguments = args
 
         let errorPipe = Pipe()
         process.standardError = errorPipe
@@ -402,7 +768,13 @@ enum HostsFileService {
             let errorMsg = String(data: errorData, encoding: .utf8) ?? ""
 
             if errorMsg.contains("password") || errorMsg.contains("sudo") {
-                try await installHelperAndApply(tmpHostsPath: tmpHostsPath, tmpPfPath: tmpPfPath, enableProxy: enableProxy)
+                try await installHelperAndApply(
+                    tmpHostsPath: tmpHostsPath,
+                    tmpPfPath: tmpPfPath,
+                    systemProxyURL: systemProxyURL,
+                    wrappersDir: wrappersDir,
+                    browserPoliciesDir: browserPoliciesDir
+                )
                 return
             }
             throw HostsFileError.adminAuthFailed(errorMsg)
@@ -410,84 +782,105 @@ enum HostsFileService {
     }
 
     /// One-time installation: creates the helper script and sudoers entry.
-    private static func installHelperAndApply(tmpHostsPath: String, tmpPfPath: String, enableProxy: Bool) async throws {
-        // The helper script handles: hosts, pf, AND proxy settings
-        let helperScript = """
-        #!/bin/bash
-        # FocusShield privileged helper v3
-        # Usage: focusshield-helper <hosts_tmp> <pf_tmp> <pac_url|disable> <enable|disable>
-        set -e
-        HOSTS_TMP="$1"
-        PF_TMP="$2"
-        PAC_URL="$3"
-        PROXY_MODE="$4"
-
-        # --- Hosts file ---
-        if [ -f "$HOSTS_TMP" ]; then
-            cp "$HOSTS_TMP" /etc/hosts
-            chmod 644 /etc/hosts
-        fi
-
-        # --- PF firewall ---
-        if [ -f "$PF_TMP" ]; then
-            mkdir -p /etc/pf.anchors
-            cp "$PF_TMP" /etc/pf.anchors/com.focusshield
-            chmod 644 /etc/pf.anchors/com.focusshield
-        fi
-        if ! grep -q 'com.focusshield' /etc/pf.conf 2>/dev/null; then
-            echo 'anchor "com.focusshield"' >> /etc/pf.conf
-            echo 'load anchor "com.focusshield" from "/etc/pf.anchors/com.focusshield"' >> /etc/pf.conf
-        fi
-        pfctl -a com.focusshield -f /etc/pf.anchors/com.focusshield 2>/dev/null || true
-        pfctl -e 2>/dev/null || true
-
-        # --- DNS cache flush ---
-        dscacheutil -flushcache 2>/dev/null || true
-        killall -HUP mDNSResponder 2>/dev/null || true
-
-        # --- PAC Proxy (for Safari/DoH browsers) ---
-        SERVICES=$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
-
-        if [ "$PROXY_MODE" = "enable" ] && [ "$PAC_URL" != "disable" ]; then
-            while IFS= read -r SERVICE; do
-                networksetup -setautoproxyurl "$SERVICE" "$PAC_URL" 2>/dev/null || true
-                networksetup -setautoproxystate "$SERVICE" on 2>/dev/null || true
-            done <<< "$SERVICES"
-        else
-            while IFS= read -r SERVICE; do
-                networksetup -setautoproxystate "$SERVICE" off 2>/dev/null || true
-            done <<< "$SERVICES"
-        fi
-        """
+    /// Uses a temporary shell script with explicit error handling per step,
+    /// followed by post-install verification.
+    private static func installHelperAndApply(
+        tmpHostsPath: String,
+        tmpPfPath: String,
+        systemProxyURL: String?,
+        wrappersDir: String? = nil,
+        browserPoliciesDir: String? = nil
+    ) async throws {
+        let helperScript = helperScriptContent()
+        let aliasScript = aliasManagerScriptContent()
+        let payloadGuardScript = payloadGuardScriptContent()
 
         let tmpHelper = FileManager.default.temporaryDirectory.appendingPathComponent("focusshield_helper_install")
+        let tmpAlias = FileManager.default.temporaryDirectory.appendingPathComponent("focusshield_update_aliases_install")
+        let tmpPayloadGuard = FileManager.default.temporaryDirectory.appendingPathComponent("focusshield_cli_guard_install")
         try helperScript.write(to: tmpHelper, atomically: true, encoding: .utf8)
+        try aliasScript.write(to: tmpAlias, atomically: true, encoding: .utf8)
+        try payloadGuardScript.write(to: tmpPayloadGuard, atomically: true, encoding: .utf8)
 
         let currentUser = NSUserName()
-        let sudoersEntry = "\(currentUser) ALL=(root) NOPASSWD: \(helperPath)\n"
+        let sudoersEntry = """
+\(currentUser) ALL=(root) NOPASSWD: \(helperPath)
+\(currentUser) ALL=(root) NOPASSWD: \(dnsProxyPath) *
+\(currentUser) ALL=(root) NOPASSWD: /bin/kill *
+\(currentUser) ALL=(root) NOPASSWD: /usr/bin/pkill -f focusshield-dns
+\(currentUser) ALL=(root) NOPASSWD: /usr/bin/killall -HUP mDNSResponder
+\(currentUser) ALL=(root) NOPASSWD: /usr/sbin/networksetup -setdnsservers *
+"""
         let tmpSudoers = FileManager.default.temporaryDirectory.appendingPathComponent("focusshield_sudoers_install")
         try sudoersEntry.write(to: tmpSudoers, atomically: true, encoding: .utf8)
 
-        defer {
-            try? FileManager.default.removeItem(at: tmpHelper)
-            try? FileManager.default.removeItem(at: tmpSudoers)
+        let proxyArg = systemProxyURL ?? "disable"
+        let modeArg = systemProxyURL == nil ? "disable" : "enable"
+
+        var helperInvocation = "'\(helperPath)' '\(tmpHostsPath)' '\(tmpPfPath)' '\(proxyArg)' '\(modeArg)'"
+        if let wrappersDir {
+            helperInvocation += " '\(wrappersDir)'"
+        }
+        if let browserPoliciesDir {
+            if wrappersDir == nil {
+                helperInvocation += " ''"
+            }
+            helperInvocation += " '\(browserPoliciesDir)'"
         }
 
-        let proxyArg = enableProxy ? PACServer.proxyURL : "disable"
-        let modeArg = enableProxy ? "enable" : "disable"
+        // Build a temporary install script with strict error handling.
+        // This replaces the fragile && chain that could silently drop the sudoers file.
+        let installScript = """
+#!/bin/bash
+set -e
 
-        let installCommand = [
-            "cp '\(tmpHelper.path)' '\(helperPath)'",
-            "chmod 755 '\(helperPath)'",
-            "chown root:wheel '\(helperPath)'",
-            "cp '\(tmpSudoers.path)' '\(sudoersPath)'",
-            "chmod 440 '\(sudoersPath)'",
-            "chown root:wheel '\(sudoersPath)'",
-            "visudo -c -f '\(sudoersPath)' || rm -f '\(sudoersPath)'",
-            "'\(helperPath)' '\(tmpHostsPath)' '\(tmpPfPath)' '\(proxyArg)' '\(modeArg)'"
-        ].joined(separator: " && ")
+# Step 1: Install helper binary and support scripts
+mkdir -p '\(supportScriptsDir)'
+cp '\(tmpHelper.path)' '\(helperPath)'
+chmod 755 '\(helperPath)'
+chown root:wheel '\(helperPath)'
+cp '\(tmpAlias.path)' '\(aliasManagerPath)'
+chmod 755 '\(aliasManagerPath)'
+chown root:wheel '\(aliasManagerPath)'
+cp '\(tmpPayloadGuard.path)' '\(payloadGuardPath)'
+chmod 755 '\(payloadGuardPath)'
+chown root:wheel '\(payloadGuardPath)'
 
-        let appleScript = "do shell script \"\(installCommand)\" with administrator privileges"
+# Step 2: Install sudoers file with validation.
+cp '\(tmpSudoers.path)' '\(sudoersPath)'
+chmod 440 '\(sudoersPath)'
+chown root:wheel '\(sudoersPath)'
+
+# Step 3: Validate sudoers syntax. On failure, remove it and abort.
+if ! /usr/sbin/visudo -c -f '\(sudoersPath)' 2>/dev/null; then
+    rm -f '\(sudoersPath)'
+    echo 'FOCUSSHIELD_ERROR: sudoers validation failed' >&2
+    exit 10
+fi
+
+# Step 4: Invoke the helper to apply the current policy.
+\(helperInvocation)
+
+# Step 5: Final verification — sudoers must still exist.
+if [ ! -f '\(sudoersPath)' ]; then
+    echo 'FOCUSSHIELD_ERROR: sudoers file missing after install' >&2
+    exit 11
+fi
+"""
+        let tmpInstallScript = FileManager.default.temporaryDirectory
+            .appendingPathComponent("focusshield_install_\(UUID().uuidString).sh")
+        try installScript.write(to: tmpInstallScript, atomically: true, encoding: .utf8)
+
+        defer {
+            try? FileManager.default.removeItem(at: tmpHelper)
+            try? FileManager.default.removeItem(at: tmpAlias)
+            try? FileManager.default.removeItem(at: tmpPayloadGuard)
+            try? FileManager.default.removeItem(at: tmpSudoers)
+            try? FileManager.default.removeItem(at: tmpInstallScript)
+        }
+
+        let shellCommand = "/bin/bash '\(tmpInstallScript.path)'"
+        let appleScript = "do shell script \"\(shellCommand)\" with administrator privileges"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -507,78 +900,456 @@ enum HostsFileService {
             if errorMessage.contains("User canceled") || errorMessage.contains("-128") {
                 throw HostsFileError.userCancelled
             }
+            if errorMessage.contains("FOCUSSHIELD_ERROR: sudoers") {
+                throw HostsFileError.helperInstallFailed(
+                    "Sudoers validation failed. The helper cannot run without a valid sudoers entry."
+                )
+            }
             throw HostsFileError.adminAuthFailed(errorMessage)
         }
+
+        // Post-install verification: confirm critical artifacts actually exist.
+        guard FileManager.default.fileExists(atPath: helperPath),
+              FileManager.default.fileExists(atPath: sudoersPath) else {
+            throw HostsFileError.helperVerificationFailed
+        }
+    }
+
+    private static func helperScriptContent() -> String {
+        """
+#!/bin/bash
+# FocusShield privileged helper v5
+# Usage: focusshield-helper <hosts_tmp> <pf_tmp> <pac_url|disable> <enable|disable> [wrappers_tmp_dir] [browser_policies_tmp_dir]
+set -e
+HOSTS_TMP="$1"
+PF_TMP="$2"
+PAC_URL="$3"
+PROXY_MODE="$4"
+WRAPPERS_TMP="$5"
+BROWSER_POLICIES_TMP="$6"
+
+if [ -f "$HOSTS_TMP" ]; then
+    cp "$HOSTS_TMP" /etc/hosts
+    chmod 644 /etc/hosts
+fi
+
+if [ -f "$PF_TMP" ]; then
+    mkdir -p /etc/pf.anchors
+    cp "$PF_TMP" "\(pfRulesPath)"
+    chmod 644 "\(pfRulesPath)"
+fi
+if ! grep -q 'com.focusshield' /etc/pf.conf 2>/dev/null; then
+    echo 'anchor "com.focusshield"' >> /etc/pf.conf
+    echo 'load anchor "com.focusshield" from "\(pfRulesPath)"' >> /etc/pf.conf
+fi
+pfctl -a com.focusshield -f "\(pfRulesPath)" 2>/dev/null || true
+pfctl -e 2>/dev/null || true
+
+dscacheutil -flushcache 2>/dev/null || true
+killall -HUP mDNSResponder 2>/dev/null || true
+
+SERVICES=$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+if [ "$PROXY_MODE" = "enable" ] && [ "$PAC_URL" != "disable" ]; then
+    while IFS= read -r SERVICE; do
+        networksetup -setautoproxyurl "$SERVICE" "$PAC_URL" 2>/dev/null || true
+        networksetup -setautoproxystate "$SERVICE" on 2>/dev/null || true
+    done <<< "$SERVICES"
+else
+    while IFS= read -r SERVICE; do
+        networksetup -setautoproxystate "$SERVICE" off 2>/dev/null || true
+    done <<< "$SERVICES"
+fi
+
+WRAPPER_STORE="\(supportScriptsDir)/wrappers"
+SAVED_DIR="\(supportScriptsDir)/saved"
+if [ -n "$WRAPPERS_TMP" ] && [ -d "$WRAPPERS_TMP" ]; then
+    mkdir -p "$WRAPPER_STORE" "$SAVED_DIR"
+    ACTIVE_TOOLS=""
+    for wrapper in "$WRAPPERS_TMP"/*; do
+        [ -f "$wrapper" ] || continue
+        TOOL=$(basename "$wrapper")
+        ACTIVE_TOOLS="$ACTIVE_TOOLS $TOOL"
+        DEST="$WRAPPER_STORE/$TOOL"
+        LINK="/usr/local/bin/$TOOL"
+        cp "$wrapper" "$DEST"
+        chmod 755 "$DEST"
+        if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+            cp "$LINK" "$SAVED_DIR/$TOOL"
+        fi
+        ln -sf "$DEST" "$LINK"
+    done
+
+    if [ -n "$SUDO_USER" ] && [ -x "\(aliasManagerPath)" ]; then
+        sudo -u "$SUDO_USER" "\(aliasManagerPath)" || true
+    fi
+
+    if [ -d "$WRAPPER_STORE" ]; then
+        for existing in "$WRAPPER_STORE"/*; do
+            [ -f "$existing" ] || continue
+            TOOL=$(basename "$existing")
+            case " $ACTIVE_TOOLS " in
+                *" $TOOL "*) ;;
+                *)
+                    rm -f "$existing" "/usr/local/bin/$TOOL"
+                    [ -f "$SAVED_DIR/$TOOL" ] && mv "$SAVED_DIR/$TOOL" "/usr/local/bin/$TOOL"
+                    ;;
+            esac
+        done
+    fi
+elif [ "$PROXY_MODE" = "disable" ]; then
+    if [ -x "\(aliasManagerPath)" ] && [ -n "$SUDO_USER" ]; then
+        sudo -u "$SUDO_USER" "\(aliasManagerPath)" --remove || true
+    fi
+
+    if [ -d "$WRAPPER_STORE" ]; then
+        for wrapper in "$WRAPPER_STORE"/*; do
+            [ -f "$wrapper" ] || continue
+            TOOL=$(basename "$wrapper")
+            rm -f "$wrapper" "/usr/local/bin/$TOOL"
+            [ -f "$SAVED_DIR/$TOOL" ] && mv "$SAVED_DIR/$TOOL" "/usr/local/bin/$TOOL"
+        done
+    fi
+fi
+
+MANAGED_PREFS_DIR="\(managedPreferencesDir)"
+FIREFOX_POLICY_DEST="\(firefoxManagedPolicyPath)"
+if [ -n "$BROWSER_POLICIES_TMP" ] && [ -d "$BROWSER_POLICIES_TMP" ]; then
+    mkdir -p "$MANAGED_PREFS_DIR" "$(dirname "$FIREFOX_POLICY_DEST")"
+
+    ACTIVE_POLICY_IDS=""
+    for policy in "$BROWSER_POLICIES_TMP"/*; do
+        [ -f "$policy" ] || continue
+        base=$(basename "$policy")
+        case "$base" in
+            *.plist)
+                bundle_id="${base%.plist}"
+                ACTIVE_POLICY_IDS="$ACTIVE_POLICY_IDS $bundle_id"
+                cp "$policy" "$MANAGED_PREFS_DIR/$base"
+                chmod 644 "$MANAGED_PREFS_DIR/$base"
+                ;;
+            org.mozilla.firefox.json)
+                ACTIVE_POLICY_IDS="$ACTIVE_POLICY_IDS org.mozilla.firefox"
+                cp "$policy" "$FIREFOX_POLICY_DEST"
+                chmod 644 "$FIREFOX_POLICY_DEST"
+                ;;
+        esac
+    done
+
+    for existing in "$MANAGED_PREFS_DIR"/*.plist; do
+        [ -f "$existing" ] || continue
+        bundle_id=$(basename "$existing" .plist)
+        case " $ACTIVE_POLICY_IDS " in
+            *" $bundle_id "*) ;;
+            *) rm -f "$existing" ;;
+        esac
+    done
+
+    case " $ACTIVE_POLICY_IDS " in
+        *" org.mozilla.firefox "*) ;;
+        *) rm -f "$FIREFOX_POLICY_DEST" ;;
+    esac
+else
+    rm -f "$MANAGED_PREFS_DIR"/com.google.Chrome.plist \
+          "$MANAGED_PREFS_DIR"/company.thebrowser.Browser.plist \
+          "$MANAGED_PREFS_DIR"/com.brave.Browser.plist \
+          "$MANAGED_PREFS_DIR"/com.microsoft.edgemac.plist \
+          "$MANAGED_PREFS_DIR"/com.operasoftware.Opera.plist \
+          "$MANAGED_PREFS_DIR"/com.vivaldi.Vivaldi.plist \
+          "$MANAGED_PREFS_DIR"/org.chromium.Chromium.plist \
+          "$FIREFOX_POLICY_DEST"
+fi
+"""
+    }
+
+    private static func aliasManagerScriptContent() -> String {
+        """
+#!/bin/bash
+set -euo pipefail
+
+TARGETS=("$HOME/.zshrc" "$HOME/.bashrc")
+ALIAS_START="# --- FocusShield Aliases START ---"
+ALIAS_END="# --- FocusShield Aliases END ---"
+WRAPPER_DIR="\(supportScriptsDir)/wrappers"
+
+remove_block() {
+    local target="$1"
+    [ -f "$target" ] || return 0
+    sed -i.bak '/# --- FocusShield Aliases START ---/,/# --- FocusShield Aliases END ---/d' "$target"
+    rm -f "${target}.bak"
+}
+
+if [ "${1:-}" = "--remove" ]; then
+    for target in "${TARGETS[@]}"; do
+        remove_block "$target"
+    done
+    exit 0
+fi
+
+ALIAS_BLOCK="$ALIAS_START\n"
+if [ -d "$WRAPPER_DIR" ]; then
+    for wrapper in "$WRAPPER_DIR"/*; do
+        [ -f "$wrapper" ] || continue
+        [ -x "$wrapper" ] || continue
+        tool=$(basename "$wrapper")
+        ALIAS_BLOCK+="alias $tool=\"$wrapper\"\n"
+    done
+fi
+ALIAS_BLOCK+="$ALIAS_END\n"
+
+for target in "${TARGETS[@]}"; do
+    [ -f "$target" ] || continue
+    remove_block "$target"
+    if [ -d "$WRAPPER_DIR" ] && [ "$(ls -A "$WRAPPER_DIR" 2>/dev/null)" ]; then
+        printf "%b" "$ALIAS_BLOCK" >> "$target"
+    fi
+done
+"""
+    }
+
+    private static func payloadGuardScriptContent() -> String {
+        """
+#!/bin/bash
+set -euo pipefail
+
+REAL_EXEC="$1"
+shift
+
+TOOL_NAME="${FOCUSSHIELD_TOOL_NAME:-$(basename "$REAL_EXEC")}"
+FILTER_MODE="${FOCUSSHIELD_FILTER_MODE:-blacklist}"
+DOMAIN_RULES_B64="${FOCUSSHIELD_DOMAIN_RULES_B64:-}"
+PAYLOAD_PROTECTION="${FOCUSSHIELD_PAYLOAD_PROTECTION:-0}"
+PATTERNS_FILE="${FOCUSSHIELD_PAYLOAD_PATTERNS_FILE:-}"
+ALLOWLIST_FILE="${FOCUSSHIELD_PAYLOAD_ALLOWLIST_FILE:-}"
+SESSION_ALLOWLIST_FILE="${FOCUSSHIELD_PAYLOAD_SESSION_ALLOWLIST_FILE:-}"
+
+SCAN_FILE=$(mktemp -t focusshield_scan.XXXXXX)
+STDIN_FILE=""
+
+cleanup() {
+    rm -f "$SCAN_FILE"
+    if [ -n "$STDIN_FILE" ] && [ -f "$STDIN_FILE" ]; then
+        rm -f "$STDIN_FILE"
+    fi
+}
+trap cleanup EXIT INT TERM HUP
+
+printf 'tool=%s\n' "$TOOL_NAME" > "$SCAN_FILE"
+printf 'argv=' >> "$SCAN_FILE"
+printf '%q ' "$@" >> "$SCAN_FILE"
+printf '\n' >> "$SCAN_FILE"
+
+if [ ! -t 0 ]; then
+    STDIN_FILE=$(mktemp -t focusshield_stdin.XXXXXX)
+    cat > "$STDIN_FILE"
+    printf '\nstdin:\n' >> "$SCAN_FILE"
+    head -c 262144 "$STDIN_FILE" >> "$SCAN_FILE" 2>/dev/null || true
+    printf '\n' >> "$SCAN_FILE"
+fi
+
+for arg in "$@"; do
+    candidate="$arg"
+    case "$candidate" in
+        @*)
+            candidate="${candidate#@}"
+            ;;
+    esac
+    if [ -f "$candidate" ]; then
+        printf '\nfile:%s\n' "$candidate" >> "$SCAN_FILE"
+        head -c 131072 "$candidate" >> "$SCAN_FILE" 2>/dev/null || true
+        printf '\n' >> "$SCAN_FILE"
+    fi
+done
+
+decode_domain_rules() {
+    if [ -z "$DOMAIN_RULES_B64" ]; then
+        return 0
+    fi
+    printf '%s' "$DOMAIN_RULES_B64" | /usr/bin/base64 -D 2>/dev/null || true
+}
+
+extract_hosts() {
+    /usr/bin/perl -ne 'while (/(?:https?:\\/\\/)?([A-Za-z0-9.-]+\\.[A-Za-z]{2,})(?::\\d+)?(?:[\\/\\s"<>]|$)/g) { print lc($1), "\\n"; }' "$SCAN_FILE" | sort -u
+}
+
+host_matches_rule() {
+    local host="$1"
+    local rule="$2"
+    case "$rule" in
+        [*].*) rule="${rule#*.}" ;;
+    esac
+    case "$host" in
+        "$rule"|*."$rule") return 0 ;;
+    esac
+    return 1
+}
+
+check_domain_policy() {
+    local rules hosts violation=0 matched
+    rules="$(decode_domain_rules)"
+    [ -n "$rules" ] || return 0
+
+    hosts="$(extract_hosts)"
+    [ -n "$hosts" ] || return 0
+
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        matched=1
+        while IFS= read -r rule; do
+            [ -n "$rule" ] || continue
+            if host_matches_rule "$host" "$rule"; then
+                matched=0
+                break
+            fi
+        done <<< "$rules"
+
+        if [ "$FILTER_MODE" = "whitelist" ] && [ "$matched" -ne 0 ]; then
+            echo "focusshield: blocked '$TOOL_NAME' because '$host' is outside the allowed domain list." >&2
+            violation=1
+        fi
+        if [ "$FILTER_MODE" = "blacklist" ] && [ "$matched" -eq 0 ]; then
+            echo "focusshield: blocked '$TOOL_NAME' because '$host' matches a blocked domain rule." >&2
+            violation=1
+        fi
+    done <<< "$hosts"
+
+    return "$violation"
+}
+
+contains_allow_fingerprint() {
+    local fingerprint="$1"
+    local file="$2"
+    [ -f "$file" ] || return 1
+    grep -Fxq "$fingerprint" "$file"
+}
+
+record_allow_fingerprint() {
+    local fingerprint="$1"
+    local file="$2"
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    if ! contains_allow_fingerprint "$fingerprint" "$file"; then
+        echo "$fingerprint" >> "$file"
+    fi
+}
+
+escape_applescript() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    printf '%s' "$value"
+}
+
+check_payload_patterns() {
+    [ "$PAYLOAD_PROTECTION" = "1" ] || return 0
+    [ -n "$PATTERNS_FILE" ] || return 0
+    [ -f "$PATTERNS_FILE" ] || return 0
+
+    local matched_names=""
+    local name regex
+
+    while IFS=$'\t' read -r name regex; do
+        [ -n "$name" ] || continue
+        [ -n "$regex" ] || continue
+        if /usr/bin/perl -0e 'use strict; use warnings; my $pattern = shift @ARGV; local $/; my $data = <STDIN>; exit(($data =~ /$pattern/im) ? 0 : 1);' "$regex" < "$SCAN_FILE"; then
+            matched_names="${matched_names}${name}\n"
+        fi
+    done < "$PATTERNS_FILE"
+
+    [ -n "$matched_names" ] || return 0
+
+    local fingerprint
+    fingerprint=$(/usr/bin/shasum -a 256 "$SCAN_FILE" | awk '{print $1}')
+    [ -n "$ALLOWLIST_FILE" ] || ALLOWLIST_FILE="/tmp/focusshield-payload-allowlist.txt"
+    [ -n "$SESSION_ALLOWLIST_FILE" ] || SESSION_ALLOWLIST_FILE="/tmp/focusshield-payload-session-allowlist.txt"
+    touch "$ALLOWLIST_FILE" "$SESSION_ALLOWLIST_FILE"
+
+    if contains_allow_fingerprint "$fingerprint" "$ALLOWLIST_FILE" || contains_allow_fingerprint "$fingerprint" "$SESSION_ALLOWLIST_FILE"; then
+        return 0
+    fi
+
+    local clean_names message button
+    clean_names=$(printf "%b" "$matched_names" | sed '/^$/d')
+    message=$(printf "FocusShield detected sensitive payload patterns for %s:\\n\\n%s\\n\\nAllow this request?" "$TOOL_NAME" "$clean_names")
+    button=$(/usr/bin/osascript -e "button returned of (display dialog \"$(escape_applescript "$message")\" buttons {\"Deny\", \"Allow Session\", \"Always Allow\"} default button \"Deny\" with icon caution)" 2>/dev/null || true)
+
+    case "$button" in
+        "Allow Session")
+            record_allow_fingerprint "$fingerprint" "$SESSION_ALLOWLIST_FILE"
+            ;;
+        "Always Allow")
+            record_allow_fingerprint "$fingerprint" "$ALLOWLIST_FILE"
+            ;;
+        *)
+            echo "focusshield: request denied because sensitive payload patterns were detected." >&2
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+check_domain_policy
+check_payload_patterns
+
+if [ -n "$STDIN_FILE" ]; then
+    exec "$REAL_EXEC" "$@" < "$STDIN_FILE"
+fi
+
+exec "$REAL_EXEC" "$@"
+"""
     }
 
     // MARK: - DNS Proxy Management
 
     /// Starts the DNS proxy server (runs as root on port 53).
     private static func startDNSProxy(mode: FilterMode = .blacklist) async throws {
-        // Kill any existing DNS proxy first
         await stopDNSProxySilent()
-
-        // Capture original DNS before changing
         captureOriginalDNS()
-
-        // Set system DNS to 127.0.0.1
         try await setSystemDNS(to: "127.0.0.1")
-
-        // Flush DNS cache so system starts using our DNS proxy immediately
         try await flushDNSCache()
-
-        // Start the DNS proxy as root (needs port 53)
-        // Get the original upstream DNS for forwarding
-        let upstreamDNS = getOriginalDNS() ?? "8.8.8.8"
-
+        let upstreamDNS = preferredUpstreamDNS(from: getOriginalDNSSettings()) ?? "8.8.8.8"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         process.arguments = [dnsProxyPath, domainsFilePath, upstreamDNS, mode.rawValue]
         process.standardOutput = Pipe()
         process.standardError = Pipe()
-
-        // Run in background (don't wait for exit — it's a long-running daemon)
         try process.run()
-        print("[DNS] Started DNS proxy (mode: \(mode.rawValue))")
+        print("[DNS] Started DNS proxy (mode: \(mode.rawValue), upstream: \(upstreamDNS))")
     }
 
     /// Stops the DNS proxy and restores original DNS.
-    private static func stopDNSProxy() async throws {
+    static func stopDNSProxy() async throws {
         await stopDNSProxySilent()
-        // Restore original DNS
-        if let originalDNS = getOriginalDNS() {
-            try await setSystemDNS(to: originalDNS)
+        let originalSettings = getOriginalDNSSettings()
+        if originalSettings.isEmpty {
+            try await setSystemDNS(to: "empty")
         } else {
-            try await setSystemDNS(to: "empty") // Reset to DHCP
+            for (service, dns) in originalSettings {
+                try await setSystemDNS(to: dns, services: [service])
+            }
         }
         try await flushDNSCache()
     }
 
-    /// Stops the DNS proxy without restoring DNS (internal use).
+    /// Stops the DNS proxy silently (internal use).
     private static func stopDNSProxySilent() async {
-        // Read PID file and kill
         if let pidString = try? String(contentsOfFile: dnsPidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            let pid = Int32(pidString) {
-            // Kill via sudo (it runs as root)
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-            process.arguments = ["kill", String(pid)]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            try? process.run()
-            process.waitUntilExit()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            proc.arguments = ["kill", String(pid)]
+            proc.standardOutput = Pipe(); proc.standardError = Pipe()
+            try? proc.run(); proc.waitUntilExit()
         }
-        // Also try pkill as fallback
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["pkill", "-f", "focusshield-dns"]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try? process.run()
-        process.waitUntilExit()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        proc.arguments = ["pkill", "-f", "focusshield-dns"]
+        proc.standardOutput = Pipe(); proc.standardError = Pipe()
+        try? proc.run(); proc.waitUntilExit()
     }
 
-    /// Sends SIGHUP to the DNS proxy to reload blocked domains.
+    /// Sends SIGHUP to reload blocked domains.
     static func reloadDNSProxy() {
         if let pidString = try? String(contentsOfFile: dnsPidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            let pid = Int32(pidString) {
@@ -592,50 +1363,78 @@ enum HostsFileService {
         // Only capture if we haven't already
         if FileManager.default.fileExists(atPath: originalDNSPath) { return }
 
+        var snapshot: [String: String] = [:]
+        for service in listNetworkServices() {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+            process.arguments = ["-getdnsservers", service]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = Pipe()
+            try? process.run()
+            process.waitUntilExit()
+
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            if output.contains("any DNS") || output.isEmpty {
+                snapshot[service] = "empty"
+            } else {
+                snapshot[service] = output.components(separatedBy: .newlines).first ?? "empty"
+            }
+        }
+
+        if let data = try? JSONEncoder().encode(snapshot) {
+            try? data.write(to: URL(fileURLWithPath: originalDNSPath), options: .atomic)
+        }
+    }
+
+    private static func getOriginalDNSSettings() -> [String: String] {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: originalDNSPath)),
+              let settings = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return settings
+    }
+
+    private static func preferredUpstreamDNS(from settings: [String: String]) -> String? {
+        settings.values.first { !$0.isEmpty && $0 != "empty" }
+    }
+
+    /// Sets system DNS servers via networksetup (requires sudo).
+    private static func setSystemDNS(to dns: String, services: [String]? = nil) async throws {
+        let targetServices = services ?? listNetworkServices()
+        for service in targetServices {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            if dns == "empty" {
+                process.arguments = ["/usr/sbin/networksetup", "-setdnsservers", service, "Empty"]
+            } else {
+                process.arguments = ["/usr/sbin/networksetup", "-setdnsservers", service, dns]
+            }
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try process.run()
+            process.waitUntilExit()
+        }
+    }
+
+    private static func listNetworkServices() -> [String] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
-        process.arguments = ["-getdnsservers", "Wi-Fi"]
+        process.arguments = ["-listallnetworkservices"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
         try? process.run()
         process.waitUntilExit()
 
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        // If it says "no DNS servers set", the system uses DHCP DNS
-        if output.contains("any DNS") || output.isEmpty {
-            try? "empty".write(toFile: originalDNSPath, atomically: true, encoding: .utf8)
-        } else {
-            // Save the first DNS server
-            let firstDNS = output.components(separatedBy: .newlines).first ?? "8.8.8.8"
-            try? firstDNS.write(toFile: originalDNSPath, atomically: true, encoding: .utf8)
-        }
-    }
-
-    /// Gets the saved original DNS server.
-    private static func getOriginalDNS() -> String? {
-        guard let dns = try? String(contentsOfFile: originalDNSPath, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !dns.isEmpty else { return nil }
-        if dns == "empty" { return nil }
-        return dns
-    }
-
-    /// Sets system DNS servers via networksetup (requires sudo).
-    private static func setSystemDNS(to dns: String) async throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        if dns == "empty" {
-            process.arguments = ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", "Empty"]
-        } else {
-            process.arguments = ["/usr/sbin/networksetup", "-setdnsservers", "Wi-Fi", dns]
-        }
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return output
+            .components(separatedBy: .newlines)
+            .dropFirst()
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("*") }
     }
 
     /// Flushes the macOS DNS cache.
@@ -667,6 +1466,8 @@ enum HostsFileError: LocalizedError {
     case adminAuthFailed(String)
     case userCancelled
     case writeFailed
+    case helperInstallFailed(String)
+    case helperVerificationFailed
 
     var errorDescription: String? {
         switch self {
@@ -676,6 +1477,10 @@ enum HostsFileError: LocalizedError {
             return "Authentication cancelled."
         case .writeFailed:
             return "Failed to write hosts file."
+        case .helperInstallFailed(let msg):
+            return "Helper installation failed: \(msg)"
+        case .helperVerificationFailed:
+            return "Helper installation could not be verified — sudoers or helper binary missing after install."
         }
     }
 }

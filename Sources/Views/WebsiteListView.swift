@@ -1,40 +1,44 @@
 import SwiftUI
 
-// MARK: - Global Rules Tab (Websites)
+// MARK: - Site List Bank Tab
 
 struct GlobalRulesTab: View {
     @Environment(FocusShieldViewModel.self) private var vm
-    let profileID: Int64
 
-    @State private var expandedGroups: Set<String> = []
+    @State private var expandedListIDs: Set<Int64> = []
     @State private var searchText = ""
-    @State private var showAddDomain = false
+    @State private var showAddList = false
+    @State private var addDomainForListID: Int64?
     @State private var newDomain = ""
-    @State private var showCategoryPicker = false
 
-    var profileWithRules: ProfileWithRules? { vm.activeProfile?.profile.id == profileID ? vm.activeProfile : nil }
-    var globalMode: FilterMode { profileWithRules?.profile.globalMode ?? .blacklist }
-    var allRules: [DomainRule] { profileWithRules?.globalDomainRules ?? [] }
+    var filteredLists: [SiteListWithDomains] {
+        guard !searchText.isEmpty else { return vm.siteLists }
 
-    var filteredGroups: [DomainGroup] {
-        let groups = DomainGroup.group(allRules)
-        guard !searchText.isEmpty else { return groups }
-        return groups.compactMap { group in
-            let filtered = group.rules.filter { $0.domain.localizedCaseInsensitiveContains(searchText) }
-            guard !filtered.isEmpty else { return nil }
-            return DomainGroup(id: group.id, label: group.label, rules: filtered)
+        return vm.siteLists.compactMap { list in
+            let matchesList = list.list.name.localizedCaseInsensitiveContains(searchText)
+            let matchingDomains = list.domains.filter { $0.domain.localizedCaseInsensitiveContains(searchText) }
+            guard matchesList || !matchingDomains.isEmpty else { return nil }
+            return SiteListWithDomains(list: list.list, domains: matchesList ? list.domains : matchingDomains)
         }
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Mode picker + search bar
-            HStack(spacing: 12) {
-                modePicker
-                Spacer()
-                Text("\(allRules.filter { $0.isEnabled }.count) active")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("\(vm.siteLists.count) reusable lists")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "square.stack.3d.up.fill")
+                        .foregroundStyle(.blue)
+                        .font(.system(size: 12))
+                    Text("Site lists are templates only. Importing a list into an app or CLI rule makes a copy, so future edits to the template do not mutate the existing app rule.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -42,63 +46,32 @@ struct GlobalRulesTab: View {
 
             Divider()
 
-            if allRules.isEmpty {
+            if vm.siteLists.isEmpty {
                 emptyState
             } else {
                 searchBar
                 Divider()
-                rulesList
+                siteListList
             }
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    Button("Add Domain…") { showAddDomain = true }
-                    Button("Add Category…") { showCategoryPicker = true }
+                Button {
+                    showAddList = true
                 } label: {
                     Image(systemName: "plus")
                 }
             }
         }
-        .sheet(isPresented: $showAddDomain) {
-            addDomainSheet
+        .sheet(isPresented: $showAddList) {
+            AddSiteListSheet()
         }
-        .sheet(isPresented: $showCategoryPicker) {
-            CategoryPickerSheet(profileID: profileID)
-        }
-    }
-
-    private var modePicker: some View {
-        HStack(spacing: 0) {
-            ForEach(FilterMode.globalModes, id: \.self) { mode in
-                Button {
-                    if var p = profileWithRules?.profile {
-                        p.globalMode = mode
-                        vm.updateProfile(&p)
-                    }
-                } label: {
-                    Text(mode.label)
-                        .font(.system(size: 12, weight: globalMode == mode ? .semibold : .regular))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
-                        .background(
-                            globalMode == mode
-                                ? (mode == .whitelist ? Color.green : Color.red)
-                                : Color.clear
-                        )
-                        .foregroundStyle(globalMode == mode ? .white : .primary)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .background(.secondary.opacity(0.12), in: Capsule())
-        .clipShape(Capsule())
     }
 
     private var searchBar: some View {
         HStack {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search domains…", text: $searchText)
+            TextField("Search site lists or domains…", text: $searchText)
                 .textFieldStyle(.plain)
             if !searchText.isEmpty {
                 Button { searchText = "" } label: {
@@ -112,30 +85,102 @@ struct GlobalRulesTab: View {
         .background(.bar)
     }
 
-    private var rulesList: some View {
+    private var siteListList: some View {
         List {
-            ForEach(filteredGroups) { group in
-                let isExpanded = expandedGroups.contains(group.id)
+            ForEach(filteredLists, id: \.list.id) { siteList in
+                let listID = siteList.list.id ?? -1
+                let isExpanded = expandedListIDs.contains(listID)
+
                 Section {
                     if isExpanded {
-                        ForEach(group.rules) { rule in
-                            DomainRuleRow(rule: rule)
+                        ForEach(siteList.domains, id: \.id) { domain in
+                            HStack(spacing: 8) {
+                                Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 18)
+                                Text(domain.domain)
+                                    .font(.system(size: 13))
+                                    .textSelection(.enabled)
+                                Spacer()
+                                if !siteList.list.isBuiltIn {
+                                    Button(role: .destructive) {
+                                        if let id = domain.id {
+                                            vm.removeDomainFromSiteList(id: id)
+                                        }
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .foregroundStyle(.red.opacity(0.7))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.leading, 20)
+                        }
+
+                        if !siteList.list.isBuiltIn {
+                            HStack(spacing: 8) {
+                                Image(systemName: "plus.circle")
+                                    .foregroundStyle(Color.accentColor)
+                                    .frame(width: 18)
+                                TextField(
+                                    "Add domain or wildcard…",
+                                    text: Binding(
+                                        get: { addDomainForListID == listID ? newDomain : "" },
+                                        set: { newDomain = $0; addDomainForListID = listID }
+                                    )
+                                )
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 12))
+                                .onSubmit {
+                                    guard !newDomain.isEmpty else { return }
+                                    vm.addDomainToSiteList(siteListID: listID, domain: newDomain)
+                                    newDomain = ""
+                                    addDomainForListID = nil
+                                }
+                            }
+                            .padding(.leading, 20)
                         }
                     }
                 } header: {
-                    GroupHeaderRow(
-                        group: group,
-                        isExpanded: isExpanded,
-                        onToggleExpand: {
-                            if isExpanded { expandedGroups.remove(group.id) }
-                            else { expandedGroups.insert(group.id) }
-                        },
-                        onToggleAll: { enabled in
-                            for rule in group.rules {
-                                if let id = rule.id { vm.toggleDomainRule(id: id, enabled: enabled) }
+                    HStack(spacing: 8) {
+                        Button {
+                            if isExpanded {
+                                expandedListIDs.remove(listID)
+                            } else {
+                                expandedListIDs.insert(listID)
                             }
+                        } label: {
+                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
                         }
-                    )
+                        .buttonStyle(.plain)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(siteList.list.name)
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("(\(siteList.domains.count))")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(siteList.list.isBuiltIn ? "Built-in list" : "Custom list")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        if !siteList.list.isBuiltIn {
+                            Button(role: .destructive) {
+                                vm.removeSiteList(id: listID)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .foregroundStyle(.red.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
             }
         }
@@ -144,172 +189,151 @@ struct GlobalRulesTab: View {
 
     private var emptyState: some View {
         ContentUnavailableView {
-            Label(globalMode == .whitelist ? "No Allowed Domains" : "No Blocked Domains",
-                  systemImage: "globe.slash")
+            Label("No Site Lists", systemImage: "square.stack.3d.up.slash")
         } description: {
-            Text(globalMode == .whitelist
-                 ? "Add domains to allow. All others will be blocked."
-                 : "Add domains to block. All others will be allowed.")
+            Text("Create reusable lists like Social Media, Streaming, Shopping, or AI Tools, then import a copy into any app or CLI rule.")
         } actions: {
-            Button("Add Domain…") { showAddDomain = true }
+            Button("Create List") { showAddList = true }
                 .buttonStyle(.borderedProminent)
-            Button("Add Category…") { showCategoryPicker = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
 
-    private var addDomainSheet: some View {
+// MARK: - Add Site List Sheet
+
+struct AddSiteListSheet: View {
+    @Environment(FocusShieldViewModel.self) private var vm
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Add Domain").font(.title2.weight(.bold))
+            Text("New Site List")
+                .font(.title2.weight(.bold))
 
-            TextField("e.g. facebook.com", text: $newDomain)
+            TextField("e.g. Social Media", text: $name)
                 .textFieldStyle(.roundedBorder)
 
             HStack {
                 Spacer()
-                Button("Cancel") { showAddDomain = false; newDomain = "" }
-                Button("Add") {
-                    vm.addDomainRule(domain: newDomain)
-                    showAddDomain = false
-                    newDomain = ""
+                Button("Cancel") { dismiss() }
+                Button("Create") {
+                    vm.addSiteList(name: name)
+                    dismiss()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(newDomain.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding()
-        .frame(minWidth: 320)
+        .frame(minWidth: 360)
     }
 }
 
-// MARK: - Group Header Row
+// MARK: - Import Site List Sheet
 
-struct GroupHeaderRow: View {
-    let group: DomainGroup
-    let isExpanded: Bool
-    let onToggleExpand: () -> Void
-    let onToggleAll: (Bool) -> Void
-
-    var body: some View {
-        HStack {
-            Button(action: onToggleExpand) {
-                HStack(spacing: 6) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text(group.label)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.primary)
-                    Text("(\(group.rules.count))")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .buttonStyle(.plain)
-
-            Spacer()
-
-            Toggle("", isOn: Binding(
-                get: { group.allEnabled },
-                set: { onToggleAll($0) }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .labelsHidden()
-        }
-    }
-}
-
-// MARK: - Individual Domain Rule Row
-
-struct DomainRuleRow: View {
-    @Environment(FocusShieldViewModel.self) private var vm
-    let rule: DomainRule
-
-    var body: some View {
-        HStack {
-            Image(systemName: "globe")
-                .foregroundStyle(.secondary)
-                .frame(width: 20)
-            Text(rule.domain)
-                .font(.system(size: 13))
-                .foregroundStyle(rule.isEnabled ? .primary : .secondary)
-            Spacer()
-            Toggle("", isOn: Binding(
-                get: { rule.isEnabled },
-                set: { enabled in
-                    if let id = rule.id { vm.toggleDomainRule(id: id, enabled: enabled) }
-                }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .labelsHidden()
-
-            Button(role: .destructive) {
-                if let id = rule.id { vm.removeDomainRule(id: id) }
-            } label: {
-                Image(systemName: "trash")
-                    .foregroundStyle(.red.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.leading, 28)
-    }
-}
-
-// MARK: - Category Picker Sheet
-
-struct CategoryPickerSheet: View {
+struct ImportSiteListSheet: View {
     @Environment(FocusShieldViewModel.self) private var vm
     @Environment(\.dismiss) private var dismiss
-    let profileID: Int64
-    @State private var selected: Set<String> = []
 
-    var body: some View {
-        let categories: [DefaultCategories.CategoryTemplate] = DefaultCategories.all
-        return NavigationStack {
-            List(categories, id: \.name) { cat in
-                categoryRow(cat)
-            }
-            .navigationTitle("Add Category")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Add Selected") {
-                        let domains = DefaultCategories.all
-                            .filter { selected.contains($0.name) }
-                            .flatMap { $0.domains }
-                        vm.addDomainRulesBulk(domains: domains)
-                        dismiss()
-                    }
-                    .disabled(selected.isEmpty)
-                }
-            }
-        }
-        .frame(minWidth: 340, minHeight: 400)
+    let profileID: Int64
+    let appRuleID: Int64
+    let title: String
+
+    @State private var selectedListID: Int64?
+    @State private var selectedDomainIDs: Set<Int64> = []
+
+    private var selectedList: SiteListWithDomains? {
+        guard let selectedListID else { return nil }
+        return vm.siteLists.first(where: { $0.list.id == selectedListID })
     }
 
-    @ViewBuilder
-    private func categoryRow(_ cat: DefaultCategories.CategoryTemplate) -> some View {
-        let isSelected = selected.contains(cat.name)
-        HStack {
-            Image(systemName: cat.icon).foregroundStyle(Color.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(cat.name).font(.system(size: 13, weight: .medium))
-                Text("\(cat.domains.count) domains")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Import Into \(title)")
+                .font(.title2.weight(.bold))
+
+            Picker("Template", selection: $selectedListID) {
+                Text("Select a site list").tag(Int64?.none)
+                ForEach(vm.siteLists, id: \.list.id) { list in
+                    Text(list.list.name).tag(list.list.id)
+                }
             }
-            Spacer()
-            if isSelected {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor)
+
+            if let selectedList {
+                HStack {
+                    Text("\(selectedDomainIDs.count) of \(selectedList.domains.count) selected")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Select All") {
+                        selectedDomainIDs = Set(selectedList.domains.compactMap(\.id))
+                    }
+                    .buttonStyle(.plain)
+                    Button("Clear") {
+                        selectedDomainIDs.removeAll()
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                List(selectedList.domains, id: \.id) { domain in
+                    let domainID = domain.id ?? -1
+                    Button {
+                        if selectedDomainIDs.contains(domainID) {
+                            selectedDomainIDs.remove(domainID)
+                        } else {
+                            selectedDomainIDs.insert(domainID)
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: selectedDomainIDs.contains(domainID) ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(selectedDomainIDs.contains(domainID) ? Color.accentColor : .secondary)
+                            Text(domain.domain)
+                                .font(.system(size: 13))
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .frame(minHeight: 260)
+            } else {
+                ContentUnavailableView("Choose a site list", systemImage: "square.stack.3d.up")
+                    .frame(maxWidth: .infinity, minHeight: 260)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Import Selected") {
+                    guard let selectedList else { return }
+                    let selectedDomains = selectedList.domains
+                        .filter { domain in
+                            guard let id = domain.id else { return false }
+                            return selectedDomainIDs.contains(id)
+                        }
+                        .map(\.domain)
+                    vm.importSiteDomains(profileID: profileID, appRuleID: appRuleID, domains: selectedDomains)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedDomainIDs.isEmpty)
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if isSelected { selected.remove(cat.name) }
-            else { selected.insert(cat.name) }
+        .padding()
+        .frame(minWidth: 460, minHeight: 520)
+        .onAppear {
+            if selectedListID == nil {
+                selectedListID = vm.siteLists.first?.list.id
+            }
+        }
+        .onChange(of: selectedListID) { _, newValue in
+            guard let newValue,
+                  let list = vm.siteLists.first(where: { $0.list.id == newValue }) else {
+                selectedDomainIDs.removeAll()
+                return
+            }
+            selectedDomainIDs = Set(list.domains.compactMap(\.id))
         }
     }
 }

@@ -1,18 +1,18 @@
 import Foundation
 import GRDB
 
-// MARK: - Filter Mode (per scope: global, per-app, per-CLI)
+// MARK: - Filter Mode (per-app and per-CLI)
 
 enum FilterMode: String, Codable, CaseIterable, DatabaseValueConvertible {
     case blacklist
     case whitelist
-    case inheritGlobal  // for app/CLI rules: defer to profile global mode
+    case inheritGlobal  // legacy compatibility for migrated rows
 
     var label: String {
         switch self {
         case .blacklist:     "Blacklist"
         case .whitelist:     "Whitelist"
-        case .inheritGlobal: "Inherit Global"
+        case .inheritGlobal: "Legacy Default"
         }
     }
 
@@ -20,14 +20,11 @@ enum FilterMode: String, Codable, CaseIterable, DatabaseValueConvertible {
         switch self {
         case .blacklist:     "Block listed domains, allow everything else"
         case .whitelist:     "Allow listed domains only, block everything else"
-        case .inheritGlobal: "Apply the profile's global filter mode"
+        case .inheritGlobal: "Legacy mode retained for existing installs"
         }
     }
 
-    /// Available modes for the global profile scope (no 'inherit')
-    static let globalModes: [FilterMode] = [.blacklist, .whitelist]
-    /// Available modes for per-app/per-CLI scope
-    static let appModes: [FilterMode] = [.blacklist, .whitelist, .inheritGlobal]
+    static let directModes: [FilterMode] = [.blacklist, .whitelist]
 
     var databaseValue: DatabaseValue { rawValue.databaseValue }
     static func fromDatabaseValue(_ dbValue: DatabaseValue) -> FilterMode? {
@@ -59,20 +56,22 @@ enum AppRuleType: String, Codable, CaseIterable {
 
 // MARK: - Domain Rule
 
-struct DomainRule: Identifiable, Codable, Hashable, FetchableRecord, PersistableRecord {
+struct DomainRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
     var id: Int64?
     var profileID: Int64
     var appRuleID: Int64?   // nil = global rule
+    var groupID: Int64?     // nil = ungrouped
     var domain: String
     var isEnabled: Bool
 
     static let databaseTableName = "domain_rules"
 
-    init(id: Int64? = nil, profileID: Int64, appRuleID: Int64? = nil,
+    init(id: Int64? = nil, profileID: Int64, appRuleID: Int64? = nil, groupID: Int64? = nil,
          domain: String, isEnabled: Bool = true) {
         self.id = id
         self.profileID = profileID
         self.appRuleID = appRuleID
+        self.groupID = groupID
         self.domain = domain
         self.isEnabled = isEnabled
     }
@@ -82,7 +81,7 @@ struct DomainRule: Identifiable, Codable, Hashable, FetchableRecord, Persistable
 
 // MARK: - App Rule (GUI app OR CLI tool)
 
-struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, PersistableRecord {
+struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
     var id: Int64?
     var profileID: Int64
     var appName: String
@@ -90,13 +89,15 @@ struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, PersistableRec
     var executablePath: String?     // full path for CLI pf rules e.g. "/usr/bin/curl"
     var ruleType: AppRuleType       // .guiApp or .cliTool
     var isBlocked: Bool             // block entire app / all CLI access?
-    var filterMode: FilterMode      // .blacklist / .whitelist / .inheritGlobal
+    var filterMode: FilterMode      // .blacklist / .whitelist / legacy .inheritGlobal
+    var isEnabled: Bool             // false = "unlinked" — rule stays in DB but enforcement skips it
 
     static let databaseTableName = "app_rules"
 
     init(id: Int64? = nil, profileID: Int64, appName: String, bundleIdentifier: String,
          executablePath: String? = nil, ruleType: AppRuleType = .guiApp,
-         isBlocked: Bool = false, filterMode: FilterMode = .inheritGlobal) {
+         isBlocked: Bool = false, filterMode: FilterMode = .blacklist,
+         isEnabled: Bool = true) {
         self.id = id
         self.profileID = profileID
         self.appName = appName
@@ -105,6 +106,7 @@ struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, PersistableRec
         self.ruleType = ruleType
         self.isBlocked = isBlocked
         self.filterMode = filterMode
+        self.isEnabled = isEnabled
     }
 
     mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
@@ -114,12 +116,12 @@ struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, PersistableRec
 
 // MARK: - Block Profile
 
-struct BlockProfile: Identifiable, Codable, Hashable, FetchableRecord, PersistableRecord {
+struct BlockProfile: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
     var id: Int64?
     var name: String
     var icon: String
     var color: String
-    var globalMode: FilterMode   // only .blacklist or .whitelist (not .inheritGlobal)
+    var globalMode: FilterMode   // legacy compatibility field; website enforcement is per app/CLI
     var sortOrder: Int
 
     static let databaseTableName = "profiles"
@@ -144,14 +146,21 @@ struct AppSettings: Codable, FetchableRecord, PersistableRecord {
     var masterEnabled: Bool
     var activeProfileID: Int64?
     var themeMode: AppThemeMode
+    var payloadProtectionEnabled: Bool
 
     static let databaseTableName = "settings"
 
-    init(masterEnabled: Bool = false, activeProfileID: Int64? = nil, themeMode: AppThemeMode = .system) {
+    init(
+        masterEnabled: Bool = false,
+        activeProfileID: Int64? = nil,
+        themeMode: AppThemeMode = .system,
+        payloadProtectionEnabled: Bool = true
+    ) {
         self.id = 1
         self.masterEnabled = masterEnabled
         self.activeProfileID = activeProfileID
         self.themeMode = themeMode
+        self.payloadProtectionEnabled = payloadProtectionEnabled
     }
 }
 
@@ -169,40 +178,59 @@ enum AppThemeMode: String, Codable, CaseIterable, DatabaseValueConvertible {
     }
 }
 
-// MARK: - Domain Grouping (view helper, not persisted)
+// MARK: - Custom Domain Group
+
+struct CustomDomainGroup: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
+    var id: Int64?
+    var profileID: Int64
+    var name: String
+
+    static let databaseTableName = "custom_groups"
+
+    init(id: Int64? = nil, profileID: Int64, name: String) {
+        self.id = id
+        self.profileID = profileID
+        self.name = name
+    }
+
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
+}
+
+// MARK: - Domain Grouping (view helper)
 
 struct DomainGroup: Identifiable {
-    let id: String      // root domain e.g. "facebook.com"
-    let label: String   // display name e.g. "Facebook"
+    let id: String      // custom group ID stringified, or "ungrouped"
+    let label: String   // display name e.g. "Work Sites"
     var rules: [DomainRule]
 
     var allEnabled: Bool  { rules.allSatisfy { $0.isEnabled } }
     var enabledCount: Int { rules.filter { $0.isEnabled }.count }
 
-    static func displayName(for rootDomain: String) -> String {
-        var name = rootDomain
-        for suffix in [".com", ".org", ".net", ".io", ".co", ".app", ".tv", ".ai"] {
-            name = name.replacingOccurrences(of: suffix, with: "")
-        }
-        return name.prefix(1).uppercased() + name.dropFirst()
-    }
+    static func build(rules: [DomainRule], groups: [CustomDomainGroup]) -> [DomainGroup] {
+        var groupMap: [Int64: [DomainRule]] = [:]
+        var ungrouped: [DomainRule] = []
 
-    static func group(_ rules: [DomainRule]) -> [DomainGroup] {
-        var groups: [String: [DomainRule]] = [:]
         for rule in rules {
-            let root = rootDomain(of: rule.domain)
-            groups[root, default: []].append(rule)
+            if let gid = rule.groupID {
+                groupMap[gid, default: []].append(rule)
+            } else {
+                ungrouped.append(rule)
+            }
         }
-        return groups.map { root, rules in
-            DomainGroup(id: root, label: displayName(for: root),
-                        rules: rules.sorted { $0.domain < $1.domain })
-        }.sorted { $0.label < $1.label }
-    }
 
-    static func rootDomain(of domain: String) -> String {
-        let parts = domain.split(separator: ".")
-        guard parts.count >= 2 else { return domain }
-        return parts.suffix(2).joined(separator: ".")
+        var result: [DomainGroup] = []
+        for group in groups {
+            let groupRules = groupMap[group.id!] ?? []
+            result.append(DomainGroup(id: String(group.id!), label: group.name,
+                                      rules: groupRules.sorted { $0.domain < $1.domain }))
+        }
+        
+        if !ungrouped.isEmpty {
+            result.append(DomainGroup(id: "ungrouped", label: "Ungrouped",
+                                      rules: ungrouped.sorted { $0.domain < $1.domain }))
+        }
+
+        return result
     }
 }
 
@@ -213,9 +241,57 @@ struct AppRuleWithDomains: Identifiable {
     var rule: AppRule
     var domainRules: [DomainRule]
 
-    /// Effective filter mode: resolve inheritGlobal against profile's globalMode
+    /// Resolve legacy `inheritGlobal` rows to blacklist after global website enforcement removal.
     func effectiveFilterMode(globalMode: FilterMode) -> FilterMode {
-        rule.filterMode == .inheritGlobal ? globalMode : rule.filterMode
+        rule.filterMode == .inheritGlobal ? .blacklist : rule.filterMode
+    }
+
+    var supportsPerAppDomainFiltering: Bool {
+        !rule.isCLI
+    }
+
+    var needsBrowserRestart: Bool {
+        AppNetworkSupport.isBrowser(bundleID: rule.bundleIdentifier)
+    }
+}
+
+// MARK: - App Network Support Matrix
+
+enum AppNetworkSupport {
+    static let browserBundleIDs: Set<String> = [
+        "com.apple.Safari",
+        "com.google.Chrome",
+        "org.mozilla.firefox",
+        "company.thebrowser.Browser",
+        "com.brave.Browser",
+        "com.microsoft.edgemac",
+        "com.operasoftware.Opera",
+        "com.vivaldi.Vivaldi",
+        "org.chromium.Chromium",
+    ]
+
+    static let chromiumManagedPolicyBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "company.thebrowser.Browser",
+        "com.brave.Browser",
+        "com.microsoft.edgemac",
+        "com.operasoftware.Opera",
+        "com.vivaldi.Vivaldi",
+        "org.chromium.Chromium",
+    ]
+
+    static func isBrowser(bundleID: String) -> Bool {
+        browserBundleIDs.contains(bundleID)
+    }
+
+    static func supportsLegacyBrowserPolicy(bundleID: String) -> Bool {
+        bundleID == "com.apple.Safari"
+            || bundleID == "org.mozilla.firefox"
+            || chromiumManagedPolicyBundleIDs.contains(bundleID)
+    }
+
+    static func usesChromiumManagedPolicy(bundleID: String) -> Bool {
+        chromiumManagedPolicyBundleIDs.contains(bundleID)
     }
 }
 
@@ -223,7 +299,7 @@ struct AppRuleWithDomains: Identifiable {
 
 struct ProfileNetworkPolicy {
     let globalMode: FilterMode
-    let globalDomains: [String]         // global allow/block list (enabled only)
+    let globalDomains: [String]
     let appDomainOverrides: [AppDomainOverride]   // per-app (GUI) overrides
     let cliRules: [CLINetworkRule]       // per-CLI pf rules
     let blockedAppBundleIDs: Set<String> // fully-blocked GUI apps
@@ -247,6 +323,7 @@ struct ProfileNetworkPolicy {
 
 struct ProfileWithRules {
     var profile: BlockProfile
+    var customDomainGroups: [CustomDomainGroup]
     var globalDomainRules: [DomainRule]
     var appRules: [AppRuleWithDomains]
 
@@ -254,29 +331,43 @@ struct ProfileWithRules {
     var cliRules: [AppRuleWithDomains]    { appRules.filter {  $0.rule.isCLI } }
 
     var blockedAppBundleIDs: Set<String> {
-        Set(guiAppRules.filter { $0.rule.isBlocked }.map { $0.rule.bundleIdentifier })
+        Set(guiAppRules.filter { $0.rule.isEnabled && $0.rule.isBlocked }.map { $0.rule.bundleIdentifier })
+    }
+
+    var blockedCLIPaths: Set<String> {
+        let paths = cliRules.filter { $0.rule.isEnabled && $0.rule.isBlocked }.compactMap { $0.rule.executablePath }
+        return Set(paths)
     }
 
     var totalEnabledDomains: Int {
-        let global = globalDomainRules.filter { $0.isEnabled }.count
         let perApp = appRules.flatMap { $0.domainRules }.filter { $0.isEnabled }.count
-        return global + perApp
+        return perApp
     }
 
     var totalAppRulesCount: Int { guiAppRules.count }
     var totalCLIRulesCount: Int { cliRules.count }
 
+    /// Expands `*.foo.com` wildcard entries into a small set of known common subdomains
+    /// for enforcement layers (hosts file, pf) that don't support wildcard syntax natively.
+    /// The DNS proxy and PAC file handle subdomain matching dynamically, so they receive the raw list.
+    private func canonicalDomains(_ domains: [String]) -> [String] {
+        var seen = Set<String>()
+        return domains
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+            .filter { seen.insert($0).inserted }
+    }
+
     /// Build the full network policy for enforcement layers
     func computeNetworkPolicy() -> ProfileNetworkPolicy {
-        let globalDomains = globalDomainRules.filter { $0.isEnabled }.map { $0.domain }
+        let globalDomains: [String] = []
 
-        // Per-app overrides (GUI apps not fully blocked)
         let appOverrides: [ProfileNetworkPolicy.AppDomainOverride] = guiAppRules
-            .filter { !$0.rule.isBlocked }
+            .filter { $0.rule.isEnabled && !$0.rule.isBlocked }
             .compactMap { appRule in
-                let domains = appRule.domainRules.filter { $0.isEnabled }.map { $0.domain }
-                guard !domains.isEmpty else { return nil }
+                let domains = canonicalDomains(appRule.domainRules.filter { $0.isEnabled }.map { $0.domain })
                 let mode = appRule.effectiveFilterMode(globalMode: profile.globalMode)
+                guard !domains.isEmpty || mode == .whitelist else { return nil }
                 return ProfileNetworkPolicy.AppDomainOverride(
                     bundleID: appRule.rule.bundleIdentifier,
                     filterMode: mode,
@@ -284,11 +375,12 @@ struct ProfileWithRules {
                 )
             }
 
-        // Per-CLI rules
+        // Per-CLI rules (skip disabled/unlinked rules)
         let cliNetworkRules: [ProfileNetworkPolicy.CLINetworkRule] = cliRules
+            .filter { $0.rule.isEnabled }
             .compactMap { cliRule in
                 guard let path = cliRule.rule.executablePath else { return nil }
-                let domains = cliRule.domainRules.filter { $0.isEnabled }.map { $0.domain }
+                let domains = canonicalDomains(cliRule.domainRules.filter { $0.isEnabled }.map { $0.domain })
                 let mode = cliRule.effectiveFilterMode(globalMode: profile.globalMode)
                 return ProfileNetworkPolicy.CLINetworkRule(
                     executablePath: path,
@@ -299,7 +391,7 @@ struct ProfileWithRules {
             }
 
         let blockedCLIPaths = Set(cliRules
-            .filter { $0.rule.isBlocked }
+            .filter { $0.rule.isEnabled && $0.rule.isBlocked }
             .compactMap { $0.rule.executablePath }
         )
 
@@ -312,6 +404,105 @@ struct ProfileWithRules {
             blockedCLIPaths: blockedCLIPaths
         )
     }
+}
+
+// MARK: - Payload Protection
+
+struct SiteList: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
+    var id: Int64?
+    var name: String
+    var isBuiltIn: Bool
+    var sortOrder: Int
+
+    static let databaseTableName = "site_lists"
+
+    init(id: Int64? = nil, name: String, isBuiltIn: Bool = false, sortOrder: Int = 0) {
+        self.id = id
+        self.name = name
+        self.isBuiltIn = isBuiltIn
+        self.sortOrder = sortOrder
+    }
+
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
+}
+
+struct SiteListDomain: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
+    var id: Int64?
+    var siteListID: Int64
+    var domain: String
+    var sortOrder: Int
+
+    static let databaseTableName = "site_list_domains"
+
+    init(id: Int64? = nil, siteListID: Int64, domain: String, sortOrder: Int = 0) {
+        self.id = id
+        self.siteListID = siteListID
+        self.domain = domain
+        self.sortOrder = sortOrder
+    }
+
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
+}
+
+struct SiteListWithDomains: Identifiable {
+    let list: SiteList
+    let domains: [SiteListDomain]
+
+    var id: Int64? { list.id }
+    var enabledDomainCount: Int { domains.count }
+}
+
+struct PayloadPattern: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
+    var id: Int64?
+    var name: String
+    var regex: String
+    var isEnabled: Bool
+    var isRecommended: Bool
+    var sortOrder: Int
+
+    static let databaseTableName = "payload_patterns"
+
+    init(
+        id: Int64? = nil,
+        name: String,
+        regex: String,
+        isEnabled: Bool = true,
+        isRecommended: Bool = true,
+        sortOrder: Int = 0
+    ) {
+        self.id = id
+        self.name = name
+        self.regex = regex
+        self.isEnabled = isEnabled
+        self.isRecommended = isRecommended
+        self.sortOrder = sortOrder
+    }
+
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
+}
+
+enum PayloadProtectionDefaults {
+    static let recommendedPatterns: [(name: String, regex: String)] = [
+        ("OpenAI API Key", #"\bsk-[A-Za-z0-9]{20,}\b"#),
+        ("Anthropic API Key", #"\bsk-ant-api[0-9]{2}-[A-Za-z0-9_-]{20,}\b"#),
+        ("GitHub Classic PAT", #"\bghp_[A-Za-z0-9]{36}\b"#),
+        ("GitHub Fine-Grained PAT", #"\bgithub_pat_[A-Za-z0-9_]{20,}\b"#),
+        ("GitHub OAuth Token", #"\bgho_[A-Za-z0-9]{36}\b"#),
+        ("GitHub App Token", #"\b(ghu|ghs)_[A-Za-z0-9]{36}\b"#),
+        ("Google API Key", #"\bAIza[0-9A-Za-z\-_]{35}\b"#),
+        ("Google OAuth Client ID", #"\b[0-9]+-[0-9A-Za-z_]{24,}\.apps\.googleusercontent\.com\b"#),
+        ("AWS Access Key ID", #"\b(A3T|AKIA|ASIA|ABIA)[A-Z0-9]{16}\b"#),
+        ("Slack App Token", #"\bxapp-[0-9A-Za-z-]{20,}\b"#),
+        ("Stripe Secret Key", #"\b(?:rk|sk)_(?:live|test)_[0-9A-Za-z]{24,}\b"#),
+        ("JWT", #"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b"#),
+        ("Firebase Auth Domain", #"\b[a-z0-9-]{2,30}\.firebaseapp\.com\b"#),
+        ("Fireworks API Key", #"\bfw_[A-Za-z0-9]{24,}\b"#),
+        ("Warp API Key", #"\bwpk-[0-9]+-[A-Fa-f0-9\-]+\b"#),
+        ("Phone Number", #"\b(?:\+?\d{1,2}\s*)?(?:\(?\d{3}\)?[\s.-]*)\d{3}[\s.-]*\d{4}\b"#),
+        ("IPv4 Address", #"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b"#),
+        ("IPv6 Address", #"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b"#),
+        ("MAC Address", #"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"#),
+    ]
 }
 
 // MARK: - System Safelist (always allowed in whitelist mode)
@@ -346,109 +537,151 @@ enum DefaultCategories {
         let domains: [String]
     }
 
+    // Each service uses *.domain.com wildcards where appropriate.
+    // The DNS proxy + PAC handle subdomain matching dynamically;
+    // hosts/pf expand these via ProfileWithRules.expandWildcards().
+
     static let socialMedia = CategoryTemplate(
         name: "Social Media", icon: "person.2.fill",
         domains: [
-            "facebook.com", "www.facebook.com", "m.facebook.com",
-            "web.facebook.com", "touch.facebook.com",
-            "instagram.com", "www.instagram.com",
-            "twitter.com", "www.twitter.com", "mobile.twitter.com",
-            "x.com", "www.x.com",
-            "linkedin.com", "www.linkedin.com",
-            "snapchat.com", "www.snapchat.com", "web.snapchat.com",
-            "pinterest.com", "www.pinterest.com",
-            "threads.net", "www.threads.net",
-            "tumblr.com", "www.tumblr.com",
+            "*.facebook.com",
+            "*.instagram.com",
+            "*.twitter.com", "*.x.com",
+            "*.linkedin.com",
+            "*.snapchat.com",
+            "*.pinterest.com",
+            "*.threads.net",
+            "*.tumblr.com",
+            "*.tiktok.com",
             "mastodon.social", "mastodon.online",
             "bsky.app", "bsky.social",
-            "bereal.com", "www.bereal.com",
-            "nextdoor.com", "www.nextdoor.com",
-            "vk.com", "www.vk.com",
-            "weibo.com", "www.weibo.com",
+            "*.bereal.com",
+            "*.nextdoor.com",
+            "*.vk.com",
+            "*.weibo.com",
+            "*.reddit.com",
         ]
     )
 
     static let messaging = CategoryTemplate(
         name: "Messaging", icon: "message.fill",
         domains: [
-            "web.whatsapp.com", "www.whatsapp.com",
-            "web.telegram.org", "telegram.org",
-            "discord.com", "www.discord.com",
-            "slack.com", "www.slack.com",
-            "messenger.com", "www.messenger.com",
-            "signal.org", "www.signal.org",
-            "line.me", "www.line.me",
-            "wechat.com", "www.wechat.com",
+            "*.whatsapp.com",
+            "*.telegram.org",
+            "*.discord.com",
+            "*.slack.com",
+            "*.messenger.com",
+            "*.signal.org",
+            "*.line.me",
+            "*.wechat.com",
+            "*.viber.com",
+            "*.kik.com",
         ]
     )
 
     static let videoStreaming = CategoryTemplate(
         name: "Video & Streaming", icon: "play.rectangle.fill",
         domains: [
-            "youtube.com", "www.youtube.com", "m.youtube.com",
-            "netflix.com", "www.netflix.com",
-            "twitch.tv", "www.twitch.tv",
-            "tiktok.com", "www.tiktok.com",
-            "hulu.com", "www.hulu.com",
-            "disneyplus.com", "www.disneyplus.com",
-            "primevideo.com", "www.primevideo.com",
-            "crunchyroll.com", "www.crunchyroll.com",
-            "dailymotion.com", "www.dailymotion.com",
-            "vimeo.com", "www.vimeo.com",
-        ]
-    )
-
-    static let forums = CategoryTemplate(
-        name: "Forums & Community", icon: "bubble.left.and.bubble.right.fill",
-        domains: [
-            "reddit.com", "www.reddit.com", "old.reddit.com",
-            "quora.com", "www.quora.com",
-            "4chan.org", "www.4chan.org",
-            "9gag.com", "www.9gag.com",
-            "imgur.com", "www.imgur.com",
+            "*.youtube.com", "youtu.be",
+            "*.netflix.com",
+            "*.twitch.tv",
+            "*.hulu.com",
+            "*.disneyplus.com",
+            "*.primevideo.com", "*.amazon.com",
+            "*.crunchyroll.com",
+            "*.dailymotion.com",
+            "*.vimeo.com",
+            "*.bilibili.com",
+            "*.peacocktv.com",
+            "*.hbomax.com",
+            "*.max.com",
+            "*.paramountplus.com",
+            "*.appletv.apple.com",
+            "*.plex.tv",
+            "*.spotify.com",
+            "*.soundcloud.com",
         ]
     )
 
     static let news = CategoryTemplate(
         name: "News & Entertainment", icon: "newspaper.fill",
         domains: [
-            "buzzfeed.com", "www.buzzfeed.com",
-            "tmz.com", "www.tmz.com",
-            "boredpanda.com", "www.boredpanda.com",
+            "*.buzzfeed.com",
+            "*.tmz.com",
+            "*.boredpanda.com",
+            "*.9gag.com",
+            "*.imgur.com",
+            "*.digg.com",
+            "*.vice.com",
+            "*.huffpost.com",
+            "*.buzzfeednews.com",
             "news.ycombinator.com",
-            "digg.com", "www.digg.com",
         ]
     )
 
     static let gaming = CategoryTemplate(
         name: "Gaming", icon: "gamecontroller.fill",
         domains: [
-            "store.steampowered.com", "steampowered.com",
-            "epicgames.com", "www.epicgames.com",
-            "roblox.com", "www.roblox.com",
-            "miniclip.com", "www.miniclip.com",
-            "poki.com", "www.poki.com",
-            "coolmathgames.com", "www.coolmathgames.com",
+            "*.steampowered.com",
+            "*.epicgames.com",
+            "*.roblox.com",
+            "*.miniclip.com",
+            "*.poki.com",
+            "*.coolmathgames.com",
+            "*.battle.net",
+            "*.ea.com",
+            "*.ubisoft.com",
+            "*.gog.com",
         ]
     )
 
     static let shopping = CategoryTemplate(
         name: "Shopping", icon: "cart.fill",
         domains: [
-            "amazon.com", "www.amazon.com",
-            "ebay.com", "www.ebay.com",
-            "aliexpress.com", "www.aliexpress.com",
-            "wish.com", "www.wish.com",
-            "etsy.com", "www.etsy.com",
-            "shopee.com", "www.shopee.com",
-            "lazada.com", "www.lazada.com",
-            "temu.com", "www.temu.com",
-            "shein.com", "www.shein.com",
+            "*.ebay.com",
+            "*.aliexpress.com",
+            "*.wish.com",
+            "*.etsy.com",
+            "*.shopee.com",
+            "*.lazada.com",
+            "*.temu.com",
+            "*.shein.com",
+            "*.alibaba.com",
+            "*.walmart.com",
+            "*.target.com",
         ]
     )
 
     static let all: [CategoryTemplate] = [
-        socialMedia, messaging, videoStreaming, forums, news, gaming, shopping,
+        socialMedia, messaging, videoStreaming, news, gaming, shopping,
+        CategoryTemplate(
+            name: "Professional Networks", icon: "person.3.sequence.fill",
+            domains: ["*.linkedin.com", "*.angel.co", "*.wellfound.com", "*.glassdoor.com"]
+        ),
+        CategoryTemplate(
+            name: "AI Tools", icon: "sparkles",
+            domains: ["*.openai.com", "*.chatgpt.com", "*.anthropic.com", "*.claude.ai", "*.perplexity.ai", "*.cursor.sh"]
+        ),
+        CategoryTemplate(
+            name: "Developer Forums", icon: "chevron.left.forwardslash.chevron.right",
+            domains: ["*.stackoverflow.com", "news.ycombinator.com", "*.reddit.com", "*.hashnode.dev", "*.dev.to"]
+        ),
+        CategoryTemplate(
+            name: "Streaming Music", icon: "music.note.list",
+            domains: ["*.spotify.com", "*.soundcloud.com", "*.music.apple.com", "*.bandcamp.com"]
+        ),
+        CategoryTemplate(
+            name: "Short Video", icon: "film.stack.fill",
+            domains: ["*.tiktok.com", "*.youtube.com", "*.instagram.com", "*.reels.facebook.com", "*.snapchat.com"]
+        ),
+        CategoryTemplate(
+            name: "Shopping & Deals", icon: "bag.fill",
+            domains: ["*.amazon.com", "*.ebay.com", "*.etsy.com", "*.temu.com", "*.shein.com", "*.walmart.com", "*.target.com"]
+        ),
+        CategoryTemplate(
+            name: "Adult Content", icon: "exclamationmark.shield.fill",
+            domains: ["*.pornhub.com", "*.xvideos.com", "*.xnxx.com", "*.onlyfans.com", "*.redtube.com"]
+        ),
     ]
 }
 

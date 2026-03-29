@@ -5,20 +5,32 @@ import Foundation
 @MainActor
 final class AppMonitorService {
     private var blockedBundleIDs: Set<String> = []
+    private var blockedCLIPaths: Set<String> = []
     private var isMonitoring = false
+    private var cliTimer: Timer?
+    private var launchObserver: NSObjectProtocol?
 
     /// Updates the set of bundle IDs to block.
     func updateBlockedApps(_ bundleIDs: Set<String>) {
         blockedBundleIDs = bundleIDs
-
-        if !bundleIDs.isEmpty && !isMonitoring {
+        checkMonitoringState()
+        terminateBlockedApps()
+    }
+    
+    /// Updates the set of CLI executable paths to block.
+    func updateBlockedCLIs(_ paths: Set<String>) {
+        blockedCLIPaths = paths
+        checkMonitoringState()
+        terminateBlockedCLIs()
+    }
+    
+    private func checkMonitoringState() {
+        let shouldMonitor = !blockedBundleIDs.isEmpty || !blockedCLIPaths.isEmpty
+        if shouldMonitor && !isMonitoring {
             startMonitoring()
-        } else if bundleIDs.isEmpty && isMonitoring {
+        } else if !shouldMonitor && isMonitoring {
             stopMonitoring()
         }
-
-        // Terminate any currently running blocked apps
-        terminateBlockedApps()
     }
 
     /// Scans /Applications for installed apps, returns display name + bundle ID.
@@ -55,7 +67,7 @@ final class AppMonitorService {
 
     private func startMonitoring() {
         isMonitoring = true
-        NSWorkspace.shared.notificationCenter.addObserver(
+        launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,
             object: nil,
             queue: .main
@@ -75,15 +87,22 @@ final class AppMonitorService {
                 }
             }
         }
+        
+        cliTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.terminateBlockedCLIs()
+            }
+        }
     }
 
     private func stopMonitoring() {
         isMonitoring = false
-        NSWorkspace.shared.notificationCenter.removeObserver(
-            self,
-            name: NSWorkspace.didLaunchApplicationNotification,
-            object: nil
-        )
+        if let launchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(launchObserver)
+            self.launchObserver = nil
+        }
+        cliTimer?.invalidate()
+        cliTimer = nil
     }
 
     private func terminateBlockedApps() {
@@ -91,6 +110,27 @@ final class AppMonitorService {
             guard let bundleID = app.bundleIdentifier,
                   blockedBundleIDs.contains(bundleID) else { continue }
             app.terminate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                if app.isTerminated == false {
+                    app.forceTerminate()
+                }
+            }
+        }
+    }
+    
+    private func terminateBlockedCLIs() {
+        guard !blockedCLIPaths.isEmpty else { return }
+        
+        let pathsToKill = blockedCLIPaths
+        DispatchQueue.global(qos: .background).async {
+            for path in pathsToKill {
+                let processName = (path as NSString).lastPathComponent
+                let task = Process()
+                task.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+                // -9 sends SIGKILL, -c matches exact command name
+                task.arguments = ["-9", "-c", processName]
+                try? task.run()
+            }
         }
     }
 

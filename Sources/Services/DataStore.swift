@@ -65,6 +65,7 @@ final class DataStore: @unchecked Sendable {
                 t.column("masterEnabled", .boolean).notNull().defaults(to: false)
                 t.column("activeProfileID", .integer)
                 t.column("themeMode", .text).notNull().defaults(to: "System")
+                t.column("payloadProtectionEnabled", .boolean).notNull().defaults(to: true)
             }
         }
         migrator.registerMigration("v2_add_cli_fields") { db in
@@ -78,6 +79,94 @@ final class DataStore: @unchecked Sendable {
             if !cols.contains("filterMode") {
                 try db.alter(table: "app_rules") { t in t.add(column: "filterMode", .text).defaults(to: "inheritGlobal") }
                 try db.execute(sql: "UPDATE app_rules SET filterMode = domainMode WHERE domainMode IS NOT NULL")
+            }
+        }
+        migrator.registerMigration("v3_add_custom_groups") { db in
+            try db.create(table: "custom_groups", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("profileID", .integer).notNull().references("profiles", onDelete: .cascade)
+                t.column("name", .text).notNull()
+            }
+            let cols = try db.columns(in: "domain_rules").map { $0.name }
+            if !cols.contains("groupID") {
+                try db.alter(table: "domain_rules") { t in
+                    t.add(column: "groupID", .integer).references("custom_groups", onDelete: .cascade)
+                }
+            }
+        }
+        migrator.registerMigration("v4_add_payload_patterns") { db in
+            try db.create(table: "payload_patterns", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("name", .text).notNull()
+                t.column("regex", .text).notNull()
+                t.column("isEnabled", .boolean).notNull().defaults(to: true)
+                t.column("isRecommended", .boolean).notNull().defaults(to: true)
+                t.column("sortOrder", .integer).notNull().defaults(to: 0)
+            }
+
+            let count = try PayloadPattern.fetchCount(db)
+            if count == 0 {
+                for (index, item) in PayloadProtectionDefaults.recommendedPatterns.enumerated() {
+                    var pattern = PayloadPattern(
+                        name: item.name,
+                        regex: item.regex,
+                        isEnabled: true,
+                        isRecommended: true,
+                        sortOrder: index
+                    )
+                    try pattern.insert(db)
+                }
+            }
+        }
+        migrator.registerMigration("v5_add_payload_settings") { db in
+            let cols = try db.columns(in: "settings").map { $0.name }
+            if !cols.contains("payloadProtectionEnabled") {
+                try db.alter(table: "settings") { t in
+                    t.add(column: "payloadProtectionEnabled", .boolean).defaults(to: true)
+                }
+            }
+        }
+        migrator.registerMigration("v6_add_site_lists") { db in
+            try db.create(table: "site_lists", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("name", .text).notNull()
+                t.column("isBuiltIn", .boolean).notNull().defaults(to: false)
+                t.column("sortOrder", .integer).notNull().defaults(to: 0)
+            }
+            try db.create(table: "site_list_domains", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("siteListID", .integer).notNull().references("site_lists", onDelete: .cascade)
+                t.column("domain", .text).notNull()
+                t.column("sortOrder", .integer).notNull().defaults(to: 0)
+            }
+
+            let count = try SiteList.fetchCount(db)
+            if count == 0 {
+                for (index, template) in DefaultCategories.all.enumerated() {
+                    var list = SiteList(name: template.name, isBuiltIn: true, sortOrder: index)
+                    try list.insert(db)
+
+                    for (domainIndex, domain) in template.domains.enumerated() {
+                        var listDomain = SiteListDomain(
+                            siteListID: list.id!,
+                            domain: domain,
+                            sortOrder: domainIndex
+                        )
+                        try listDomain.insert(db)
+                    }
+                }
+            }
+        }
+        migrator.registerMigration("v7_disable_global_website_mode") { db in
+            try db.execute(sql: "UPDATE profiles SET globalMode = 'blacklist'")
+        }
+        migrator.registerMigration("v8_make_per_app_modes_explicit") { db in
+            try db.execute(sql: "UPDATE app_rules SET filterMode = 'blacklist' WHERE filterMode = 'inheritGlobal'")
+        }
+        migrator.registerMigration("v9_add_app_rule_enabled") { db in
+            let cols = try db.columns(in: "app_rules").map { $0.name }
+            if !cols.contains("isEnabled") {
+                try db.alter(table: "app_rules") { t in t.add(column: "isEnabled", .boolean).defaults(to: true) }
             }
         }
         try migrator.migrate(q)
@@ -141,7 +230,33 @@ final class DataStore: @unchecked Sendable {
 
             for cat in DefaultCategories.all {
                 for domain in cat.domains {
-                    var rule = DomainRule(profileID: studyID, domain: domain)
+                    let parts = domain.split(separator: ".")
+                    let groupName: String
+                    if parts.count >= 2 {
+                        // Extract base domain name (e.g. "facebook" from "m.facebook.com")
+                        let base = String(parts[parts.count - 2])
+                        // Handle special cases like "co.uk" where we need the part before
+                        if (base == "co" || base == "com") && parts.count >= 3 {
+                            groupName = String(parts[parts.count - 3]).capitalized
+                        } else {
+                            groupName = base.capitalized
+                        }
+                    } else {
+                        groupName = "Other"
+                    }
+                    
+                    let groupID: Int64
+                    if let existing = try CustomDomainGroup
+                        .filter(Column("profileID") == studyID && Column("name") == groupName)
+                        .fetchOne(db) {
+                        groupID = existing.id!
+                    } else {
+                        var newGroup = CustomDomainGroup(profileID: studyID, name: groupName)
+                        try newGroup.insert(db)
+                        groupID = newGroup.id!
+                    }
+                    
+                    var rule = DomainRule(profileID: studyID, groupID: groupID, domain: domain)
                     try rule.insert(db)
                 }
             }
@@ -159,7 +274,7 @@ final class DataStore: @unchecked Sendable {
             try breakProfile.insert(db)
 
             // Default settings
-            var settings = AppSettings(masterEnabled: false, activeProfileID: nil)
+            let settings = AppSettings(masterEnabled: false, activeProfileID: nil)
             try settings.insert(db)
         }
     }
@@ -217,6 +332,97 @@ final class DataStore: @unchecked Sendable {
         try? dbQueue.write { db in try settings.save(db) }
     }
 
+    // MARK: - Site Lists
+
+    func fetchSiteLists() -> [SiteList] {
+        (try? dbQueue.read { db in
+            try SiteList.order(Column("sortOrder"), Column("name")).fetchAll(db)
+        }) ?? []
+    }
+
+    func fetchSiteListDomains(siteListID: Int64) -> [SiteListDomain] {
+        (try? dbQueue.read { db in
+            try SiteListDomain
+                .filter(Column("siteListID") == siteListID)
+                .order(Column("sortOrder"), Column("domain"))
+                .fetchAll(db)
+        }) ?? []
+    }
+
+    func fetchSiteListsWithDomains() -> [SiteListWithDomains] {
+        fetchSiteLists().map { list in
+            SiteListWithDomains(list: list, domains: list.id.map(fetchSiteListDomains(siteListID:)) ?? [])
+        }
+    }
+
+    @discardableResult
+    func saveSiteList(_ list: inout SiteList) -> Int64 {
+        (try? dbQueue.write { db in
+            try list.save(db)
+            return list.id!
+        }) ?? 0
+    }
+
+    func deleteSiteList(id: Int64) {
+        _ = try? dbQueue.write { db in try SiteList.deleteOne(db, key: id) }
+    }
+
+    @discardableResult
+    func saveSiteListDomain(_ domain: inout SiteListDomain) -> Int64 {
+        (try? dbQueue.write { db in
+            try domain.save(db)
+            return domain.id!
+        }) ?? 0
+    }
+
+    func deleteSiteListDomain(id: Int64) {
+        _ = try? dbQueue.write { db in try SiteListDomain.deleteOne(db, key: id) }
+    }
+
+    func addSiteListDomains(siteListID: Int64, domains: [String]) {
+        _ = try? dbQueue.write { db in
+            let existingCount = try SiteListDomain
+                .filter(Column("siteListID") == siteListID)
+                .fetchCount(db)
+
+            for (offset, domain) in domains.enumerated() {
+                var item = SiteListDomain(siteListID: siteListID, domain: domain, sortOrder: existingCount + offset)
+                try item.insert(db)
+            }
+        }
+    }
+
+    // MARK: - Payload Patterns
+
+    func fetchPayloadPatterns() -> [PayloadPattern] {
+        (try? dbQueue.read { db in
+            try PayloadPattern
+                .order(Column("sortOrder"), Column("name"))
+                .fetchAll(db)
+        }) ?? []
+    }
+
+    @discardableResult
+    func savePayloadPattern(_ pattern: inout PayloadPattern) -> Int64 {
+        (try? dbQueue.write { db in
+            try pattern.save(db)
+            return pattern.id!
+        }) ?? 0
+    }
+
+    func deletePayloadPattern(id: Int64) {
+        _ = try? dbQueue.write { db in try PayloadPattern.deleteOne(db, key: id) }
+    }
+
+    func togglePayloadPattern(id: Int64, enabled: Bool) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE payload_patterns SET isEnabled = ? WHERE id = ?",
+                arguments: [enabled, id]
+            )
+        }
+    }
+
     // MARK: - Profiles
 
     func fetchAllProfiles() -> [BlockProfile] {
@@ -241,6 +447,26 @@ final class DataStore: @unchecked Sendable {
         _ = try? dbQueue.write { db in try BlockProfile.deleteOne(db, key: id) }
     }
 
+    // MARK: - Custom Domain Groups
+
+    func fetchCustomGroups(profileID: Int64) -> [CustomDomainGroup] {
+        (try? dbQueue.read { db in
+            try CustomDomainGroup.filter(Column("profileID") == profileID).fetchAll(db)
+        }) ?? []
+    }
+
+    @discardableResult
+    func saveCustomGroup(_ group: inout CustomDomainGroup) -> Int64 {
+        (try? dbQueue.write { db in
+            try group.save(db)
+            return group.id!
+        }) ?? 0
+    }
+
+    func deleteCustomGroup(id: Int64) {
+        _ = try? dbQueue.write { db in try CustomDomainGroup.deleteOne(db, key: id) }
+    }
+
     // MARK: - Domain Rules
 
     func fetchGlobalDomainRules(profileID: Int64) -> [DomainRule] {
@@ -255,6 +481,10 @@ final class DataStore: @unchecked Sendable {
         (try? dbQueue.read { db in
             try DomainRule.filter(Column("appRuleID") == appRuleID).fetchAll(db)
         }) ?? []
+    }
+
+    func fetchDomainRule(id: Int64) -> DomainRule? {
+        try? dbQueue.read { db in try DomainRule.fetchOne(db, key: id) }
     }
 
     @discardableResult
@@ -275,11 +505,18 @@ final class DataStore: @unchecked Sendable {
                            arguments: [enabled, id])
         }
     }
+    
+    func updateDomainRuleGroup(id: Int64, groupID: Int64?) {
+        _ = try? dbQueue.write { db in
+            try db.execute(sql: "UPDATE domain_rules SET groupID = ? WHERE id = ?",
+                           arguments: [groupID, id])
+        }
+    }
 
-    func addDomainRules(profileID: Int64, appRuleID: Int64? = nil, domains: [String]) {
+    func addDomainRules(profileID: Int64, appRuleID: Int64? = nil, groupID: Int64? = nil, domains: [String]) {
         _ = try? dbQueue.write { db in
             for domain in domains {
-                var rule = DomainRule(profileID: profileID, appRuleID: appRuleID, domain: domain)
+                var rule = DomainRule(profileID: profileID, appRuleID: appRuleID, groupID: groupID, domain: domain)
                 try rule.insert(db)
             }
         }
@@ -291,6 +528,10 @@ final class DataStore: @unchecked Sendable {
         (try? dbQueue.read { db in
             try AppRule.filter(Column("profileID") == profileID).fetchAll(db)
         }) ?? []
+    }
+
+    func fetchAppRule(id: Int64) -> AppRule? {
+        try? dbQueue.read { db in try AppRule.fetchOne(db, key: id) }
     }
 
     @discardableResult
@@ -312,6 +553,13 @@ final class DataStore: @unchecked Sendable {
         }
     }
 
+    func toggleAppEnabled(id: Int64, enabled: Bool) {
+        _ = try? dbQueue.write { db in
+            try db.execute(sql: "UPDATE app_rules SET isEnabled = ? WHERE id = ?",
+                           arguments: [enabled, id])
+        }
+    }
+
     func updateAppFilterMode(id: Int64, filterMode: FilterMode) {
         _ = try? dbQueue.write { db in
             try db.execute(sql: "UPDATE app_rules SET filterMode = ? WHERE id = ?",
@@ -324,6 +572,7 @@ final class DataStore: @unchecked Sendable {
     func fetchProfileWithRules(id: Int64) -> ProfileWithRules? {
         guard let profile = fetchProfile(id: id) else { return nil }
         let globalRules = fetchGlobalDomainRules(profileID: id)
+        let customGroups = fetchCustomGroups(profileID: id)
         let appRules = fetchAppRules(profileID: id)
         let appRulesWithDomains = appRules.map { rule in
             AppRuleWithDomains(
@@ -331,7 +580,7 @@ final class DataStore: @unchecked Sendable {
                 domainRules: rule.id.map { fetchDomainRules(appRuleID: $0) } ?? []
             )
         }
-        return ProfileWithRules(profile: profile, globalDomainRules: globalRules,
+        return ProfileWithRules(profile: profile, customDomainGroups: customGroups, globalDomainRules: globalRules,
                                 appRules: appRulesWithDomains)
     }
 }

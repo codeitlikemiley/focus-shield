@@ -1,94 +1,229 @@
 import Foundation
-import Network
+#if canImport(Darwin)
+import Darwin
+#endif
 
-/// A lightweight HTTP server that serves the PAC (Proxy Auto-Config) file
-/// on localhost. Safari ignores `file://` PAC URLs but respects `http://`.
+/// A lightweight HTTP server that serves per-app PAC (Proxy Auto-Config) files.
 ///
-/// The server runs on port 9876 and responds to any request with the PAC file content.
+/// Endpoints (all dynamically keyed, nothing hardcoded):
+///   /proxy.pac          — global PAC (system proxy default, used by Safari if not overridden)
+///   /{bundleID}.pac     — per-app PAC for any app the user adds (e.g. /com.google.Chrome.pac)
+///   /cli-{name}.pac     — per-CLI tool PAC (injected via http_proxy env var in wrappers)
 final class PACServer {
     static let shared = PACServer()
     static let port: UInt16 = 9876
 
-    private var listener: NWListener?
-    private var pacContent: String = ""
     private let queue = DispatchQueue(label: "com.focusshield.pacserver")
+    private var listeningSockets: [Int32] = []
+    private var acceptSources: [DispatchSourceRead] = []
 
-    /// Returns the URL to use for system proxy auto-config.
-    static var proxyURL: String {
-        "http://127.0.0.1:\(port)/proxy.pac"
+    /// PAC content keyed by URL path (e.g. "/proxy.pac", "/com.google.Chrome.pac")
+    private var pacTable: [String: String] = [:]
+
+    // MARK: - URL helpers
+
+    /// System proxy URL — always the global PAC (or Safari-override if user adds Safari)
+    static var proxyURL: String { "http://localhost:\(port)/proxy.pac" }
+
+    /// Returns the PAC URL for any app given its bundle ID.
+    static func pacURL(bundleID: String) -> String {
+        "http://localhost:\(port)/\(bundleID).pac"
     }
 
-    /// Update the PAC content and (re)start the server.
+    /// Returns the PAC URL for a CLI tool given its executable name.
+    static func cliPACURL(tool: String) -> String {
+        "http://localhost:\(port)/cli-\(tool).pac"
+    }
+
+    // MARK: - Content management
+
+    func updateAll(globalPAC: String, appPACs: [String: String], cliPACs: [String: String] = [:]) {
+        var table: [String: String] = ["/proxy.pac": globalPAC]
+        for (bundleID, content) in appPACs {
+            table["/\(bundleID).pac"] = content
+        }
+        for (tool, content) in cliPACs {
+            table["/cli-\(tool).pac"] = content
+        }
+        pacTable = table
+        ensureRunning()
+    }
+
     func start(with pacContent: String) {
-        self.pacContent = pacContent
+        updateAll(globalPAC: pacContent, appPACs: [:])
+    }
 
-        // If already running, just update content — no restart needed
-        if listener != nil { return }
+    func updateContent(_ content: String) {
+        pacTable["/proxy.pac"] = content
+        ensureRunning()
+    }
 
-        do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
-            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.port)!)
-        } catch {
-            print("[PACServer] Failed to create listener: \(error)")
+    func stop() {
+        acceptSources.forEach { $0.cancel() }
+        acceptSources.removeAll()
+        listeningSockets.removeAll()
+    }
+
+    // MARK: - Private
+
+    private func ensureRunning() {
+        guard acceptSources.isEmpty else { return }
+
+        let sockets = [makeIPv4Socket(), makeIPv6Socket()].compactMap { $0 }
+        guard !sockets.isEmpty else {
+            print("[PACServer] Failed to bind any loopback socket on port \(Self.port)")
             return
         }
 
-        listener?.newConnectionHandler = { [weak self] connection in
-            self?.handleConnection(connection)
+        for socket in sockets {
+            let source = DispatchSource.makeReadSource(fileDescriptor: socket, queue: queue)
+            source.setEventHandler { [weak self] in
+                self?.acceptConnections(on: socket)
+            }
+            source.setCancelHandler {
+                close(socket)
+            }
+            source.resume()
+            acceptSources.append(source)
+            listeningSockets.append(socket)
         }
 
-        listener?.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                print("[PACServer] Listening on port \(Self.port)")
-            case .failed(let error):
-                print("[PACServer] Failed: \(error)")
-            default:
-                break
+        print("[PACServer] Listening on 127.0.0.1 and/or ::1 port \(Self.port)")
+    }
+
+    private func makeIPv4Socket() -> Int32? {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+
+        if configureSocket(fd) == false {
+            close(fd)
+            return nil
+        }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(Self.port).bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
 
-        listener?.start(queue: queue)
+        guard bindResult == 0, listen(fd, SOMAXCONN) == 0 else {
+            close(fd)
+            return nil
+        }
+
+        return fd
     }
 
-    /// Stop the PAC server.
-    func stop() {
-        listener?.cancel()
-        listener = nil
-        print("[PACServer] Stopped")
+    private func makeIPv6Socket() -> Int32? {
+        let fd = socket(AF_INET6, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+
+        if configureSocket(fd) == false {
+            close(fd)
+            return nil
+        }
+
+        var onlyV6: Int32 = 1
+        _ = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &onlyV6, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in6()
+        addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = in_port_t(Self.port).bigEndian
+        addr.sin6_addr = in6addr_loopback
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+
+        guard bindResult == 0, listen(fd, SOMAXCONN) == 0 else {
+            close(fd)
+            return nil
+        }
+
+        return fd
     }
 
-    /// Update PAC content without restarting.
-    func updateContent(_ content: String) {
-        self.pacContent = content
+    private func configureSocket(_ fd: Int32) -> Bool {
+        var reuse: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            return false
+        }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            return false
+        }
+
+        return true
     }
 
-    // MARK: - Connection handling
+    private func acceptConnections(on socket: Int32) {
+        while true {
+            var storage = sockaddr_storage()
+            var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let client = withUnsafeMutablePointer(to: &storage) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(socket, $0, &length)
+                }
+            }
 
-    private func handleConnection(_ connection: NWConnection) {
-        connection.start(queue: queue)
+            if client < 0 {
+                if errno == EWOULDBLOCK || errno == EAGAIN {
+                    break
+                }
+                return
+            }
 
-        // Read the HTTP request (we don't really need to parse it)
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
-            guard let self = self else { return }
+            queue.async { [weak self] in
+                self?.handleClient(client)
+            }
+        }
+    }
 
-            let responseBody = self.pacContent
-            let httpResponse = [
-                "HTTP/1.1 200 OK",
-                "Content-Type: application/x-ns-proxy-autoconfig",
-                "Content-Length: \(responseBody.utf8.count)",
-                "Connection: close",
-                "Cache-Control: no-cache",
-                "",
-                responseBody
-            ].joined(separator: "\r\n")
+    private func handleClient(_ client: Int32) {
+        defer { close(client) }
 
-            let responseData = httpResponse.data(using: .utf8)!
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let count = read(client, &buffer, buffer.count)
+        guard count > 0 else { return }
 
-            connection.send(content: responseData, completion: .contentProcessed { _ in
-                connection.cancel()
-            })
+        let requestStr = String(decoding: buffer.prefix(count), as: UTF8.self)
+        let requestPath = requestStr
+            .components(separatedBy: "\r\n").first?
+            .components(separatedBy: " ")
+            .dropFirst().first ?? "/proxy.pac"
+
+        let body = pacTable[requestPath]
+            ?? pacTable["/proxy.pac"]
+            ?? "function FindProxyForURL(url, host) { return \"DIRECT\"; }\n"
+
+        let response = [
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/x-ns-proxy-autoconfig",
+            "Content-Length: \(body.utf8.count)",
+            "Connection: close",
+            "Cache-Control: no-cache",
+            "",
+            body,
+        ].joined(separator: "\r\n")
+
+        let bytes = Array(response.utf8)
+        var sent = 0
+        while sent < bytes.count {
+            let written = bytes.withUnsafeBytes { rawBuffer in
+                write(client, rawBuffer.baseAddress!.advanced(by: sent), bytes.count - sent)
+            }
+            guard written > 0 else { break }
+            sent += written
         }
     }
 }

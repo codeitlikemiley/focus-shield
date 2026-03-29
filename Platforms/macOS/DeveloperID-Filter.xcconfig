@@ -1,0 +1,3 @@
+// Developer ID signing for FocusShieldFilterData target
+#include "DeveloperID.xcconfig"
+PROVISIONING_PROFILE_SPECIFIER = Focus Shield - FIlter Data

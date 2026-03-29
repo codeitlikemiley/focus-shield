@@ -6,34 +6,28 @@ struct ProfileDetailView: View {
     @Environment(FocusShieldViewModel.self) private var vm
     let profile: BlockProfile
     @Binding var selectedTab: ContentView.RuleTab
+    let openLists: () -> Void
     @State private var showEditor = false
 
-    var isActive: Bool { vm.settings.activeProfileID == profile.id }
-
+    var isSelectedProfile: Bool { vm.settings.activeProfileID == profile.id }
+    var isShieldEnabled: Bool { vm.settings.masterEnabled }
+    var isActive: Bool { isSelectedProfile && isShieldEnabled }
     var color: Color { Color(hex: profile.color) ?? .accentColor }
+    var siteListCount: Int { vm.siteLists.count }
 
+    /// Load fresh rules for this profile (not just the active one).
     var profileWithRules: ProfileWithRules? {
-        vm.activeProfile?.profile.id == profile.id ? vm.activeProfile : nil
+        _ = vm.dataVersion
+        guard let id = profile.id else { return nil }
+        return vm.fetchProfileWithRules(id: id)
     }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 0) {
-                // Header card
-                profileHeader
-                    .padding()
-
+                profileHeader.padding()
                 Divider()
-
-                // Stats grid
-                statsGrid
-                    .padding()
-
-                Divider()
-
-                // Quick-jump buttons
-                quickJumpSection
-                    .padding()
+                statsGrid.padding()
             }
         }
         .navigationTitle(profile.name)
@@ -61,11 +55,11 @@ struct ProfileDetailView: View {
             VStack(spacing: 4) {
                 Text(profile.name)
                     .font(.title2.weight(.bold))
-
-                modeLabel
+                Text("Per-app and per-CLI traffic rules")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
 
-            // Activate / Deactivate
             if isActive {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill")
@@ -78,6 +72,26 @@ struct ProfileDetailView: View {
                     vm.deactivateProfile()
                 }
                 .controlSize(.small)
+                if vm.networkFilterState == .awaitingApproval || vm.networkFilterState == .rebootRequired {
+                    Text(vm.networkFilterState.summary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                }
+            } else if isSelectedProfile {
+                HStack(spacing: 8) {
+                    Image(systemName: "power.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Shield Off")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.orange)
+                }
+                Button("Turn Shield On") {
+                    vm.masterEnabled = true
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .tint(color)
             } else {
                 Button("Activate Profile") {
                     if let id = profile.id { vm.activateProfile(id) }
@@ -89,25 +103,15 @@ struct ProfileDetailView: View {
         }
     }
 
-    private var modeLabel: some View {
-        HStack(spacing: 6) {
-            Image(systemName: profile.globalMode == .whitelist ? "checkmark.shield.fill" : "xmark.shield.fill")
-                .foregroundStyle(profile.globalMode == .whitelist ? .green : .red)
-            Text("\(profile.globalMode.label) Mode")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.secondary)
-        }
-    }
-
     private var statsGrid: some View {
         let rules = profileWithRules
         return LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
             StatCard(
-                title: "Websites",
-                value: "\(rules?.globalDomainRules.filter { $0.isEnabled }.count ?? 0)",
-                systemImage: "globe",
+                title: "Templates",
+                value: "\(siteListCount)",
+                systemImage: "square.stack.3d.up.fill",
                 color: .blue
-            ) { selectedTab = .websites }
+            ) { openLists() }
 
             StatCard(
                 title: "App Rules",
@@ -124,32 +128,11 @@ struct ProfileDetailView: View {
             ) { selectedTab = .cli }
 
             StatCard(
-                title: "Blocked Apps",
-                value: "\(rules?.blockedAppBundleIDs.count ?? 0)",
-                systemImage: "stop.circle.fill",
+                title: "Attached Sites",
+                value: "\(rules?.totalEnabledDomains ?? 0)",
+                systemImage: "globe",
                 color: .red
             ) { selectedTab = .apps }
-        }
-    }
-
-    private var quickJumpSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("QUICK ACCESS")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-
-            ForEach(ContentView.RuleTab.allCases, id: \.self) { tab in
-                Button {
-                    selectedTab = tab
-                } label: {
-                    Label(tab.rawValue, systemImage: tab.systemImage)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 6)
-                        .padding(.horizontal, 10)
-                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                }
-                .buttonStyle(.plain)
-            }
         }
     }
 }

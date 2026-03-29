@@ -11,7 +11,6 @@ struct ProfileEditorSheet: View {
     @State private var name: String = ""
     @State private var icon: String = "shield.fill"
     @State private var color: Color = .blue
-    @State private var globalMode: FilterMode = .blacklist
 
     private var isNew: Bool { profile == nil }
 
@@ -54,20 +53,10 @@ struct ProfileEditorSheet: View {
 
                     ColorPicker("Accent Color", selection: $color, supportsOpacity: false)
                 }
-
-                Section("Mode") {
-                    Picker("Global Filter Mode", selection: $globalMode) {
-                        ForEach(FilterMode.globalModes, id: \.self) { mode in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(mode.label)
-                                Text(mode.description)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .tag(mode)
-                        }
-                    }
-                    .pickerStyle(.radioGroup)
+                Section("Rules") {
+                    Text("Website filtering is configured on each app or CLI rule. Reusable site lists live in the Lists section in the sidebar and can be imported into any rule as a copy.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
@@ -77,7 +66,6 @@ struct ProfileEditorSheet: View {
                     name = p.name
                     icon = p.icon
                     color = Color(hex: p.color) ?? .blue
-                    globalMode = p.globalMode
                 }
             }
             .toolbar {
@@ -103,14 +91,12 @@ struct ProfileEditorSheet: View {
             existing.name = name.trimmingCharacters(in: .whitespaces)
             existing.icon = icon
             existing.color = hexColor
-            existing.globalMode = globalMode
             vm.updateProfile(&existing)
         } else {
             var newProfile = BlockProfile(
                 name: name.trimmingCharacters(in: .whitespaces),
                 icon: icon,
                 color: hexColor,
-                globalMode: globalMode,
                 sortOrder: vm.profiles.count
             )
             vm.createProfile(&newProfile)

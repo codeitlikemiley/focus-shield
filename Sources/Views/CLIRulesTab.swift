@@ -8,12 +8,12 @@ struct CLIRulesTab: View {
 
     @State private var expandedRuleID: Int64? = nil
     @State private var showAddCLI = false
+    @State private var importSiteListRule: AppRuleImportTarget?
     @State private var searchText = ""
     @State private var newDomain = ""
     @State private var addDomainForRuleID: Int64? = nil
 
-    var profileWithRules: ProfileWithRules? { vm.activeProfile?.profile.id == profileID ? vm.activeProfile : nil }
-    var globalMode: FilterMode { profileWithRules?.profile.globalMode ?? .blacklist }
+    @State private var profileWithRules: ProfileWithRules?
 
     var cliRules: [AppRuleWithDomains] {
         let rules = profileWithRules?.cliRules ?? []
@@ -26,7 +26,7 @@ struct CLIRulesTab: View {
             // Info bar
             HStack {
                 Image(systemName: "info.circle").foregroundStyle(.blue).font(.system(size: 12))
-                Text("CLI rules use pf firewall (process-level). Requires macOS 14.4+.")
+                Text("CLI rules now run through a wrapper preflight that can reject visible destination hosts and sensitive payloads before the command executes. Commands that hide their network targets internally still need the future transport-aware engine for full coverage.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -50,9 +50,8 @@ struct CLIRulesTab: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    Button("Add from Presets…") { showAddCLI = true }
-                    Button("Add Custom CLI Tool…") { showAddCLI = true }
+                Button {
+                    showAddCLI = true
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -60,6 +59,18 @@ struct CLIRulesTab: View {
         }
         .sheet(isPresented: $showAddCLI) {
             AddCLIRuleSheet(profileID: profileID)
+        }
+        .sheet(item: $importSiteListRule) { target in
+            ImportSiteListSheet(profileID: profileID, appRuleID: target.ruleID, title: target.title)
+        }
+        .onAppear {
+            profileWithRules = vm.fetchProfileWithRules(id: profileID)
+        }
+        .onChange(of: vm.dataVersion) { oldValue, newValue in
+            profileWithRules = vm.fetchProfileWithRules(id: profileID)
+        }
+        .onChange(of: profileID) { oldValue, newValue in
+            profileWithRules = vm.fetchProfileWithRules(id: newValue)
         }
     }
 
@@ -111,10 +122,12 @@ struct CLIRulesTab: View {
                     Picker("", selection: Binding(
                         get: { cliRule.rule.filterMode },
                         set: { mode in
-                            if let id = ruleID { vm.setCLIFilterMode(id: id, filterMode: mode) }
+                            if let id = ruleID {
+                                vm.setCLIFilterMode(profileID: profileID, id: id, filterMode: mode)
+                            }
                         }
                     )) {
-                        SwiftUI.ForEach(FilterMode.appModes, id: \.self) { mode in
+                        SwiftUI.ForEach(FilterMode.directModes, id: \.self) { mode in
                             Text(mode.label).tag(mode)
                         }
                     }
@@ -123,21 +136,41 @@ struct CLIRulesTab: View {
                 }
                 .padding(.leading, 16)
 
-                // Domain rules
+                HStack {
+                    Text("Templates")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Import Site List…") {
+                        if let ruleID {
+                            importSiteListRule = AppRuleImportTarget(ruleID: ruleID, title: cliRule.rule.appName)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.leading, 16)
+
+                // Per-CLI domain rules
                 SwiftUI.ForEach(cliRule.domainRules, id: \.id) { domainRule in
                     HStack {
-                        Image(systemName: "globe").foregroundStyle(.secondary).frame(width: 16)
+                        Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
                         Text(domainRule.domain).font(.system(size: 12))
                         Spacer()
                         Toggle("", isOn: Binding(
                             get: { domainRule.isEnabled },
                             set: { on in
-                                if let id = domainRule.id { vm.toggleDomainRule(id: id, enabled: on) }
+                                if let id = domainRule.id {
+                                    vm.toggleDomainRule(profileID: profileID, id: id, enabled: on)
+                                }
                             }
                         ))
                         .toggleStyle(.switch).controlSize(.mini).labelsHidden()
                         Button(role: .destructive) {
-                            if let id = domainRule.id { vm.removeDomainRule(id: id) }
+                            if let id = domainRule.id {
+                                vm.removeDomainRule(profileID: profileID, id: id)
+                            }
                         } label: {
                             Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
                         }
@@ -157,7 +190,7 @@ struct CLIRulesTab: View {
                     .font(.system(size: 12))
                     .onSubmit {
                         if !newDomain.isEmpty, let rID = ruleID {
-                            vm.addDomainRule(domain: newDomain, appRuleID: rID)
+                            vm.addDomainRule(profileID: profileID, domain: newDomain, appRuleID: rID)
                             newDomain = ""
                             addDomainForRuleID = nil
                         }
@@ -167,8 +200,8 @@ struct CLIRulesTab: View {
             }
         } header: {
             CLIRuleHeaderRow(
+                profileID: profileID,
                 cliRule: cliRule,
-                globalMode: globalMode,
                 isExpanded: isExpanded,
                 onToggleExpand: {
                     expandedRuleID = isExpanded ? nil : ruleID
@@ -194,10 +227,12 @@ struct CLIRulesTab: View {
 
 struct CLIRuleHeaderRow: View {
     @Environment(FocusShieldViewModel.self) private var vm
+    let profileID: Int64
     let cliRule: AppRuleWithDomains
-    let globalMode: FilterMode
     let isExpanded: Bool
     let onToggleExpand: () -> Void
+
+    private var isLinked: Bool { cliRule.rule.isEnabled }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -209,19 +244,24 @@ struct CLIRuleHeaderRow: View {
             .buttonStyle(.plain)
 
             Image(systemName: "terminal.fill")
-                .foregroundStyle(cliRule.rule.isBlocked ? .red : .purple)
+                .foregroundStyle(isLinked ? (cliRule.rule.isBlocked ? .red : .purple) : .gray)
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(cliRule.rule.appName)
                     .font(.system(.subheadline, design: .monospaced).weight(.medium))
+                    .foregroundStyle(isLinked ? .primary : .secondary)
                 HStack(spacing: 4) {
-                    if cliRule.rule.isBlocked {
+                    if !isLinked {
+                        Label("Disabled", systemImage: "link.badge.plus")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.orange)
+                    } else if cliRule.rule.isBlocked {
                         Label("All traffic blocked", systemImage: "stop.circle.fill")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.red)
                     } else if !cliRule.domainRules.isEmpty {
-                        let mode = cliRule.effectiveFilterMode(globalMode: globalMode)
+                        let mode = cliRule.effectiveFilterMode(globalMode: .blacklist)
                         Label("\(cliRule.domainRules.count) domains · \(mode.label)", systemImage: "list.bullet")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
@@ -238,21 +278,38 @@ struct CLIRuleHeaderRow: View {
             Toggle("Block", isOn: Binding(
                 get: { cliRule.rule.isBlocked },
                 set: { blocked in
-                    if let id = cliRule.rule.id { vm.toggleCLIBlocked(id: id, blocked: blocked) }
+                    if let id = cliRule.rule.id {
+                        vm.toggleCLIBlocked(profileID: profileID, id: id, blocked: blocked)
+                    }
                 }
             ))
             .toggleStyle(.switch)
             .controlSize(.mini)
             .labelsHidden()
             .help(cliRule.rule.isBlocked ? "Unblock all traffic" : "Block all network traffic")
+            .disabled(!isLinked)
+            .opacity(isLinked ? 1 : 0.4)
+
+            // Unlink / Link button
+            Button {
+                if let id = cliRule.rule.id {
+                    vm.toggleAppEnabled(profileID: profileID, id: id, enabled: !isLinked)
+                }
+            } label: {
+                Image(systemName: isLinked ? "link" : "link.badge.plus")
+                    .foregroundStyle(isLinked ? Color.secondary : Color.orange)
+            }
+            .buttonStyle(.plain)
+            .help(isLinked ? "Disable rule (keep domain lists)" : "Re-enable rule")
 
             Button(role: .destructive) {
-                if let id = cliRule.rule.id { vm.removeAppRule(id: id) }
+                if let id = cliRule.rule.id { vm.removeAppRule(profileID: profileID, id: id) }
             } label: {
                 Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
             }
             .buttonStyle(.plain)
         }
+        .opacity(isLinked ? 1 : 0.7)
     }
 }
 
@@ -267,7 +324,7 @@ struct AddCLIRuleSheet: View {
     @State private var customName = ""
     @State private var customPath = ""
     @State private var isBlocked = false
-    @State private var filterMode: FilterMode = .inheritGlobal
+    @State private var filterMode: FilterMode = .blacklist
     @State private var mode: SheetMode = .presets
 
     enum SheetMode { case presets, custom }
@@ -314,7 +371,7 @@ struct AddCLIRuleSheet: View {
                     Toggle("Block all outbound traffic", isOn: $isBlocked)
                     if !isBlocked {
                         Picker("Filter Mode", selection: $filterMode) {
-                            ForEach(FilterMode.appModes, id: \.self) { mode in
+                            ForEach(FilterMode.directModes, id: \.self) { mode in
                                 Text(mode.label).tag(mode)
                             }
                         }
@@ -331,6 +388,7 @@ struct AddCLIRuleSheet: View {
                     Button("Add") {
                         if mode == .presets, let preset = selectedPreset {
                             vm.addCLIRule(
+                                profileID: profileID,
                                 name: preset.name,
                                 executablePath: preset.executablePath ?? customPath,
                                 blocked: isBlocked,
@@ -338,6 +396,7 @@ struct AddCLIRuleSheet: View {
                             )
                         } else {
                             vm.addCLIRule(
+                                profileID: profileID,
                                 name: customName,
                                 executablePath: customPath,
                                 blocked: isBlocked,

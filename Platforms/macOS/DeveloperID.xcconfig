@@ -1,0 +1,7 @@
+// Developer ID signing configuration
+// Applied only to FocusShield targets (not SPM dependencies)
+CODE_SIGN_IDENTITY = Developer ID Application
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM = 5KZ8MD34QW
+CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO
+OTHER_CODE_SIGN_FLAGS = --timestamp

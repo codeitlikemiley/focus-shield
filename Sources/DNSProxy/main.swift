@@ -88,11 +88,14 @@ func parseDomainFromQuery(_ data: Data) -> String? {
 
 func isDomainBlocked(_ domain: String) -> Bool {
     if domainList.contains(domain) { return true }
-    // Check parent domains for wildcard matching
+    if domainList.contains("*.\(domain)") { return true }
+    // Check explicit *.domain.com wildcard entries in the list
     var parts = domain.split(separator: ".")
     while parts.count > 1 {
         parts.removeFirst()
-        if domainList.contains(parts.joined(separator: ".")) { return true }
+        let parent = parts.joined(separator: ".")
+        if domainList.contains(parent) { return true }
+        if domainList.contains("*.\(parent)") { return true }
     }
     return false
 }
@@ -103,12 +106,14 @@ func isDomainAllowed(_ domain: String) -> Bool {
     if isInSafelist(domain) { return true }
     // Check exact match in allowed list
     if domainList.contains(domain) { return true }
+    if domainList.contains("*.\(domain)") { return true }
     // Check parent domains for wildcard matching
     var parts = domain.split(separator: ".")
     while parts.count > 1 {
         parts.removeFirst()
         let parent = parts.joined(separator: ".")
         if domainList.contains(parent) { return true }
+        if domainList.contains("*.\(parent)") { return true }
         if isInSafelist(parent) { return true }
     }
     return false

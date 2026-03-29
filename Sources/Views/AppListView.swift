@@ -10,11 +10,11 @@ struct AppRulesTab: View {
     @State private var expandedRuleID: Int64? = nil
     @State private var showAddApp = false
     @State private var showBrowseApps = false
+    @State private var importSiteListRule: AppRuleImportTarget?
     @State private var newDomain = ""
     @State private var addDomainForRuleID: Int64? = nil
 
-    var profileWithRules: ProfileWithRules? { vm.activeProfile?.profile.id == profileID ? vm.activeProfile : nil }
-    var globalMode: FilterMode { profileWithRules?.profile.globalMode ?? .blacklist }
+    @State private var profileWithRules: ProfileWithRules?
 
     var appRules: [AppRuleWithDomains] {
         let rules = profileWithRules?.guiAppRules ?? []
@@ -25,11 +25,68 @@ struct AppRulesTab: View {
     var body: some View {
         VStack(spacing: 0) {
             // Summary bar
-            HStack {
-                Text("\(profileWithRules?.guiAppRules.count ?? 0) apps · \(profileWithRules?.blockedAppBundleIDs.count ?? 0) fully blocked")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                Spacer()
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("\(profileWithRules?.guiAppRules.count ?? 0) apps · \(profileWithRules?.blockedAppBundleIDs.count ?? 0) fully blocked")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.blue)
+                        .font(.system(size: 12))
+                    Text("Chrome and Firefox use managed browser policies and PAC proxy for per-site blocking. Safari per-site blocking requires an approved Network Extension. All browsers support full-app blocking.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                if vm.enforcementHealth.safariNeedsNetworkExtension && !vm.enforcementHealth.networkExtensionActive {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                                .font(.system(size: 12))
+                            Text("Safari has domain rules, but the Network Extension is not active. Enable it in **System Settings → General → Login Items & Extensions → Network Extensions**.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.orange)
+                        }
+                        Button {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        } label: {
+                            Label("Open Network Extensions Settings", systemImage: "gear")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .padding(.leading, 20)
+                    }
+                }
+                if vm.networkFilterState == .awaitingApproval || vm.networkFilterState == .rebootRequired {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                                .font(.system(size: 12))
+                            Text(vm.networkFilterState.summary)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.orange)
+                        }
+                        Button {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        } label: {
+                            Label("Allow in System Settings", systemImage: "arrow.up.forward.app.fill")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                        .controlSize(.small)
+                        .padding(.leading, 20)
+                    }
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -49,7 +106,7 @@ struct AppRulesTab: View {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button("Browse Installed Apps…") {
-                        vm.scanInstalledApps()
+                        vm.scanInstalledApps(excludingProfile: profileID)
                         showBrowseApps = true
                     }
                     Button("Add Manually…") { showAddApp = true }
@@ -63,6 +120,18 @@ struct AppRulesTab: View {
         }
         .sheet(isPresented: $showAddApp) {
             AddAppSheet(profileID: profileID)
+        }
+        .sheet(item: $importSiteListRule) { target in
+            ImportSiteListSheet(profileID: profileID, appRuleID: target.ruleID, title: target.title)
+        }
+        .onAppear {
+            profileWithRules = vm.fetchProfileWithRules(id: profileID)
+        }
+        .onChange(of: vm.dataVersion) { oldValue, newValue in
+            profileWithRules = vm.fetchProfileWithRules(id: profileID)
+        }
+        .onChange(of: profileID) { oldValue, newValue in
+            profileWithRules = vm.fetchProfileWithRules(id: newValue)
         }
     }
 
@@ -96,72 +165,105 @@ struct AppRulesTab: View {
         let isExpanded: Bool = expandedRuleID != nil && expandedRuleID == ruleID
         Section {
             if isExpanded {
-                // Filter mode picker
-                HStack {
-                    Text("Domain Filter")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("", selection: Binding(
-                        get: { appRule.rule.filterMode },
-                        set: { mode in
-                            if let id = ruleID { vm.setAppFilterMode(id: id, filterMode: mode) }
-                        }
-                    )) {
-                        SwiftUI.ForEach(FilterMode.appModes, id: \.self) { mode in
-                            Text(mode.label).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .controlSize(.small)
-                }
-                .padding(.leading, 16)
-
-                // Domain rules
-                SwiftUI.ForEach(appRule.domainRules, id: \.id) { domainRule in
+                if appRule.supportsPerAppDomainFiltering {
                     HStack {
-                        Image(systemName: "globe").foregroundStyle(.secondary).frame(width: 16)
-                        Text(domainRule.domain).font(.system(size: 12))
+                        Text("Domain Filter")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
                         Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { domainRule.isEnabled },
-                            set: { on in if let id = domainRule.id { vm.toggleDomainRule(id: id, enabled: on) } }
-                        ))
-                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                        Button(role: .destructive) {
-                            if let id = domainRule.id { vm.removeDomainRule(id: id) }
-                        } label: {
-                            Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
+                        Picker("", selection: Binding(
+                            get: { appRule.rule.filterMode },
+                            set: { mode in
+                                if let id = ruleID {
+                                    vm.setAppFilterMode(profileID: profileID, id: id, filterMode: mode)
+                                }
+                            }
+                        )) {
+                            SwiftUI.ForEach(FilterMode.directModes, id: \.self) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .controlSize(.small)
+                    }
+                    .padding(.leading, 16)
+
+                    HStack {
+                        Text("Templates")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Import Site List…") {
+                            if let ruleID {
+                                importSiteListRule = AppRuleImportTarget(ruleID: ruleID, title: appRule.rule.appName)
+                            }
                         }
                         .buttonStyle(.plain)
                     }
-                    .padding(.leading, 32)
-                }
+                    .padding(.leading, 16)
 
-                // Add domain
-                HStack {
-                    Image(systemName: "plus.circle").foregroundStyle(Color.accentColor).frame(width: 16)
-                    TextField("Add domain for \(appRule.rule.appName)…",
-                              text: Binding(
-                                get: { addDomainForRuleID == ruleID ? newDomain : "" },
-                                set: { newDomain = $0; addDomainForRuleID = ruleID }
-                              ))
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .onSubmit {
-                        if !newDomain.isEmpty, let rID = ruleID {
-                            vm.addDomainRule(domain: newDomain, appRuleID: rID)
-                            newDomain = ""
-                            addDomainForRuleID = nil
+                    SwiftUI.ForEach(appRule.domainRules, id: \.id) { domainRule in
+                        HStack {
+                            Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 16)
+                            Text(domainRule.domain).font(.system(size: 12))
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { domainRule.isEnabled },
+                                set: { on in
+                                    if let id = domainRule.id {
+                                        vm.toggleDomainRule(profileID: profileID, id: id, enabled: on)
+                                    }
+                                }
+                            ))
+                            .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                            Button(role: .destructive) {
+                                if let id = domainRule.id {
+                                    vm.removeDomainRule(profileID: profileID, id: id)
+                                }
+                            } label: {
+                                Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.leading, 32)
+                    }
+
+                    HStack {
+                        Image(systemName: "plus.circle").foregroundStyle(Color.accentColor).frame(width: 16)
+                        TextField("Add domain for \(appRule.rule.appName)…",
+                                  text: Binding(
+                                    get: { addDomainForRuleID == ruleID ? newDomain : "" },
+                                    set: { newDomain = $0; addDomainForRuleID = ruleID }
+                                  ))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .onSubmit {
+                            if !newDomain.isEmpty, let rID = ruleID {
+                                vm.addDomainRule(profileID: profileID, domain: newDomain, appRuleID: rID)
+                                newDomain = ""
+                                addDomainForRuleID = nil
+                            }
                         }
                     }
+                    .padding(.leading, 32)
+                } else {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .frame(width: 16)
+                        Text("Per-domain filtering for this app is not available in the current runtime.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.leading, 16)
                 }
-                .padding(.leading, 32)
             }
         } header: {
             AppRuleHeaderRow(
+                profileID: profileID,
                 appRule: appRule,
-                globalMode: globalMode,
                 isExpanded: isExpanded,
                 onToggleExpand: {
                     expandedRuleID = isExpanded ? nil : ruleID
@@ -177,7 +279,7 @@ struct AppRulesTab: View {
             Text("Add apps to control their network access per profile.")
         } actions: {
             Button("Browse Apps…") {
-                vm.scanInstalledApps()
+                vm.scanInstalledApps(excludingProfile: profileID)
                 showBrowseApps = true
             }
             .buttonStyle(.borderedProminent)
@@ -190,10 +292,12 @@ struct AppRulesTab: View {
 
 struct AppRuleHeaderRow: View {
     @Environment(FocusShieldViewModel.self) private var vm
+    let profileID: Int64
     let appRule: AppRuleWithDomains
-    let globalMode: FilterMode
     let isExpanded: Bool
     let onToggleExpand: () -> Void
+
+    private var isLinked: Bool { appRule.rule.isEnabled }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -205,24 +309,33 @@ struct AppRuleHeaderRow: View {
             .buttonStyle(.plain)
 
             Image(systemName: "app.fill")
-                .foregroundStyle(appRule.rule.isBlocked ? .red : .blue)
+                .foregroundStyle(isLinked ? (appRule.rule.isBlocked ? .red : .blue) : .gray)
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(appRule.rule.appName)
                     .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(isLinked ? .primary : .secondary)
                 HStack(spacing: 4) {
-                    if appRule.rule.isBlocked {
+                    if !isLinked {
+                        Label("Disabled", systemImage: "link.badge.plus")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.orange)
+                    } else if appRule.rule.isBlocked {
                         Label("Blocked", systemImage: "stop.circle.fill")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.red)
+                    } else if !appRule.supportsPerAppDomainFiltering {
+                        Label("Full block only", systemImage: "bolt.horizontal.circle")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
                     } else if !appRule.domainRules.isEmpty {
-                        let mode = appRule.effectiveFilterMode(globalMode: globalMode)
+                        let mode = appRule.effectiveFilterMode(globalMode: .blacklist)
                         Label("\(appRule.domainRules.count) domain rules · \(mode.label)", systemImage: "list.bullet")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Inherit Global")
+                        Text("No site restrictions")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     }
@@ -231,26 +344,50 @@ struct AppRuleHeaderRow: View {
 
             Spacer()
 
-            // Block toggle
+            // Block toggle — disabled when rule is unlinked
             Toggle("Block", isOn: Binding(
                 get: { appRule.rule.isBlocked },
                 set: { blocked in
-                    if let id = appRule.rule.id { vm.toggleAppBlocked(id: id, blocked: blocked) }
+                    if let id = appRule.rule.id {
+                        vm.toggleAppBlocked(profileID: profileID, id: id, blocked: blocked)
+                    }
                 }
             ))
             .toggleStyle(.switch)
             .controlSize(.mini)
             .labelsHidden()
             .help(appRule.rule.isBlocked ? "Unblock app" : "Block app entirely")
+            .disabled(!isLinked)
+            .opacity(isLinked ? 1 : 0.4)
+
+            // Unlink / Link button
+            Button {
+                if let id = appRule.rule.id {
+                    vm.toggleAppEnabled(profileID: profileID, id: id, enabled: !isLinked)
+                }
+            } label: {
+                Image(systemName: isLinked ? "link" : "link.badge.plus")
+                    .foregroundStyle(isLinked ? Color.secondary : Color.orange)
+            }
+            .buttonStyle(.plain)
+            .help(isLinked ? "Disable rule (keep domain lists)" : "Re-enable rule")
 
             Button(role: .destructive) {
-                if let id = appRule.rule.id { vm.removeAppRule(id: id) }
+                if let id = appRule.rule.id { vm.removeAppRule(profileID: profileID, id: id) }
             } label: {
                 Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
             }
             .buttonStyle(.plain)
         }
+        .opacity(isLinked ? 1 : 0.7)
     }
+}
+
+struct AppRuleImportTarget: Identifiable {
+    let ruleID: Int64
+    let title: String
+
+    var id: Int64 { ruleID }
 }
 
 // MARK: - Browse Apps Sheet
@@ -277,8 +414,8 @@ struct BrowseAppsSheet: View {
                     }
                     Spacer()
                     Button("Add") {
-                        vm.addAppRule(name: app.name, bundleID: app.bundleIdentifier)
-                        vm.scanInstalledApps()
+                        vm.addAppRule(profileID: profileID, name: app.name, bundleID: app.bundleIdentifier)
+                        vm.scanInstalledApps(excludingProfile: profileID)
                     }
                     .controlSize(.small)
                 }
@@ -315,7 +452,7 @@ struct AddAppSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Add") {
-                    vm.addAppRule(name: appName, bundleID: bundleID, blocked: isBlocked)
+                    vm.addAppRule(profileID: profileID, name: appName, bundleID: bundleID, blocked: isBlocked)
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)

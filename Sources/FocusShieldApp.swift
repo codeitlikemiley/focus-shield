@@ -5,15 +5,44 @@ import AppKit
 // MARK: - App Delegate
 
 /// Custom delegate that prevents the main window from being destroyed on close.
+@MainActor
 class FocusShieldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, ObservableObject {
     @Published var isWindowVisible = true
     var viewModel: FocusShieldViewModel?
 
     private var mainWindow: NSWindow?
+    private var restartObserver: NSObjectProtocol?
+    private var isPresentingBrowserRestartAlert = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Enforce single instance
+        if let bundleID = Bundle.main.bundleIdentifier {
+            let runningApps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            let currentPID = ProcessInfo.processInfo.processIdentifier
+            if let existing = runningApps.first(where: { $0.processIdentifier != currentPID }) {
+                print("Another instance of Focus Shield is already running. Activating it and terminating this duplicate.")
+                existing.activate(options: .activateAllWindows)
+                NSApplication.shared.terminate(nil)
+                return
+            }
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            // Must activate so an LSUIElement app window can accept keyboard input
+            NSApplication.shared.activate(ignoringOtherApps: true)
             self?.findAndConfigureMainWindow()
+            self?.mainWindow?.makeKeyAndOrderFront(nil)
+        }
+
+        restartObserver = NotificationCenter.default.addObserver(
+            forName: .focusShieldBrowserRestartRequired,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.presentPendingBrowserRestartIfNeeded()
+            }
         }
     }
 
@@ -27,6 +56,7 @@ class FocusShieldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        presentPendingBrowserRestartIfNeeded()
         sender.orderOut(nil)
         isWindowVisible = false
         return false
@@ -58,12 +88,50 @@ class FocusShieldAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     func hideMainWindow() {
+        presentPendingBrowserRestartIfNeeded()
         mainWindow?.orderOut(nil)
         isWindowVisible = false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let restartObserver {
+            NotificationCenter.default.removeObserver(restartObserver)
+            self.restartObserver = nil
+        }
         viewModel?.cleanupOnQuit()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            self?.viewModel?.refreshNetworkFilterStatus(force: true)
+        }
+    }
+
+    func presentPendingBrowserRestartIfNeeded() {
+        guard let vm = viewModel, vm.hasPendingBrowserRestart else { return }
+        guard !isPresentingBrowserRestartAlert else { return }
+        let names = vm.runningBrowserNames
+        guard !names.isEmpty else {
+            vm.hasPendingBrowserRestart = false
+            return
+        }
+
+        isPresentingBrowserRestartAlert = true
+        defer { isPresentingBrowserRestartAlert = false }
+
+        let alert = NSAlert()
+        alert.messageText = "Restart Browsers?"
+        alert.informativeText = "You have updated the Focus Shield rules. To enforce these changes immediately, open browsers (\(names.joined(separator: ", "))) must be restarted to clear their active connections.\n\nDo you want to restart them now?"
+        alert.addButton(withTitle: "Restart Now")
+        alert.addButton(withTitle: "Later")
+        alert.alertStyle = .informational
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            vm.restartBrowsers()
+        } else {
+            vm.hasPendingBrowserRestart = true
+        }
     }
 }
 

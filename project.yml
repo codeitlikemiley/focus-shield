@@ -14,6 +14,14 @@ settings:
     MARKETING_VERSION: "1.0.0"
     CURRENT_PROJECT_VERSION: 1
 
+packages:
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts.git
+    from: 2.2.3
+  GRDB:
+    url: https://github.com/groue/GRDB.swift.git
+    from: 7.0.0
+
 targets:
   # ── macOS App ───────────────────────────────────────────────
   FocusShield-macOS:
@@ -23,7 +31,18 @@ targets:
     sources:
       - path: Sources
         excludes:
+          - "DNSProxy/**"
           - "iOS/**"
+      - path: Platforms/macOS/Assets.xcassets
+        type: folder.assetcatalog
+    dependencies:
+      - package: KeyboardShortcuts
+      - package: GRDB
+        product: GRDB
+      - target: FocusShieldFilterData
+        embed: true
+    configFiles:
+      Release: Platforms/macOS/DeveloperID-App.xcconfig
     settings:
       base:
         PRODUCT_NAME: Focus Shield
@@ -31,6 +50,25 @@ targets:
         INFOPLIST_FILE: Platforms/macOS/Info.plist
         CODE_SIGN_ENTITLEMENTS: Platforms/macOS/FocusShield.entitlements
         ENABLE_HARDENED_RUNTIME: true
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  FocusShieldFilterData:
+    type: system-extension
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Extensions/FocusShieldFilterData
+      - path: Sources/Shared/NetworkFilterPolicy.swift
+    configFiles:
+      Release: Platforms/macOS/DeveloperID-Filter.xcconfig
+    settings:
+      base:
+        PRODUCT_NAME: com.focusshield.macos.filter-data
+        PRODUCT_BUNDLE_IDENTIFIER: com.focusshield.macos.filter-data
+        INFOPLIST_FILE: Platforms/macOS/FocusShieldFilterData-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Platforms/macOS/FocusShieldFilterData.entitlements
+        ENABLE_HARDENED_RUNTIME: true
+        SKIP_INSTALL: NO
 
   # ── iOS App ─────────────────────────────────────────────────
   FocusShield-iOS:
@@ -40,12 +78,17 @@ targets:
     sources:
       - path: Sources
         excludes:
+          - "DNSProxy/**"
           - "iOS/**"
           - "Services/HostsFileService.swift"
           - "Services/AppMonitorService.swift"
           - "FocusShieldApp.swift"
           - "Views/**"
       - path: Sources/iOS
+    dependencies:
+      - package: KeyboardShortcuts
+      - package: GRDB
+        product: GRDB
     settings:
       base:
         PRODUCT_NAME: Focus Shield

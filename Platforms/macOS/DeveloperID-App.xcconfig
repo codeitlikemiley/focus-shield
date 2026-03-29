@@ -1,0 +1,3 @@
+// Developer ID signing for FocusShield-macOS target
+#include "DeveloperID.xcconfig"
+PROVISIONING_PROFILE_SPECIFIER = Focus Shield

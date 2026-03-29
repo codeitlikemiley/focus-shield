@@ -11,7 +11,7 @@ struct ProfileSidebarView: View {
         List(selection: $selectedProfileID) {
             Section("PROFILES") {
                 ForEach(vm.profiles) { profile in
-                    ProfileRowView(profile: profile)
+                    ProfileRowView(profile: profile, isSelected: selectedProfileID == profile.id)
                         .tag(profile.id!)
                 }
             }
@@ -52,8 +52,9 @@ struct ProfileSidebarView: View {
 struct ProfileRowView: View {
     @Environment(FocusShieldViewModel.self) private var vm
     let profile: BlockProfile
+    let isSelected: Bool
 
-    var isActive: Bool { vm.settings.activeProfileID == profile.id }
+    var isActive: Bool { vm.settings.activeProfileID == profile.id && vm.settings.masterEnabled }
 
     var color: Color {
         Color(hex: profile.color) ?? .accentColor
@@ -63,22 +64,20 @@ struct ProfileRowView: View {
         HStack(spacing: 10) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(color.opacity(0.15))
+                    .fill(isSelected ? .white.opacity(0.2) : color.opacity(0.15))
                     .frame(width: 32, height: 32)
                 Image(systemName: profile.icon)
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(color)
+                    .foregroundStyle(isSelected ? .white : color)
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(profile.name)
                     .font(.system(size: 13, weight: .medium))
                     .lineLimit(1)
-                HStack(spacing: 4) {
-                    modeChip(profile.globalMode)
-                    if isActive {
-                        activeChip
-                    }
+                    .foregroundStyle(isSelected ? .white : .primary)
+                if isActive {
+                    activeChip
                 }
             }
             Spacer(minLength: 0)
@@ -87,25 +86,13 @@ struct ProfileRowView: View {
         .contentShape(Rectangle())
     }
 
-    private func modeChip(_ mode: FilterMode) -> some View {
-        Text(mode.label)
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(mode == .whitelist ? Color.green : Color.red)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(
-                Capsule()
-                    .fill(mode == .whitelist ? Color.green.opacity(0.12) : Color.red.opacity(0.12))
-            )
-    }
-
     private var activeChip: some View {
         Text("ACTIVE")
             .font(.system(size: 9, weight: .bold))
-            .foregroundStyle(.white)
+            .foregroundStyle(isSelected ? Color.accentColor : .white)
             .padding(.horizontal, 5)
             .padding(.vertical, 2)
-            .background(Capsule().fill(Color.accentColor))
+            .background(Capsule().fill(isSelected ? .white : Color.accentColor))
     }
 }
 

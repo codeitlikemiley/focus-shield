@@ -37,11 +37,18 @@ enum BrowserService {
     }
 
     /// Gracefully quits a browser and relaunches it after a short delay.
-    /// Uses AppleScript `quit` which triggers session save, so tabs are restored on relaunch.
+    /// Closes windows before quit so stale blocked tabs are not restored on relaunch.
     static func restartBrowsers(bundleIDs: [String]) async {
-        // Step 1: Gracefully quit each browser
+        // Step 1: Close windows and quit each browser so blocked tabs do not survive from session restore.
         for bundleID in bundleIDs {
-            let script = "tell application id \"\(bundleID)\" to quit"
+            let script = """
+tell application id "\(bundleID)"
+    try
+        close every window
+    end try
+    quit
+end tell
+"""
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             process.arguments = ["-e", script]
