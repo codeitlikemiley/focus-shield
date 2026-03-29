@@ -105,19 +105,7 @@ final class DataStore: @unchecked Sendable {
                 t.column("sortOrder", .integer).notNull().defaults(to: 0)
             }
 
-            let count = try PayloadPattern.fetchCount(db)
-            if count == 0 {
-                for (index, item) in PayloadProtectionDefaults.recommendedPatterns.enumerated() {
-                    var pattern = PayloadPattern(
-                        name: item.name,
-                        regex: item.regex,
-                        isEnabled: true,
-                        isRecommended: true,
-                        sortOrder: index
-                    )
-                    try pattern.insert(db)
-                }
-            }
+            try seedDefaultPayloadPatterns(in: db)
         }
         migrator.registerMigration("v5_add_payload_settings") { db in
             let cols = try db.columns(in: "settings").map { $0.name }
@@ -141,22 +129,7 @@ final class DataStore: @unchecked Sendable {
                 t.column("sortOrder", .integer).notNull().defaults(to: 0)
             }
 
-            let count = try SiteList.fetchCount(db)
-            if count == 0 {
-                for (index, template) in DefaultCategories.all.enumerated() {
-                    var list = SiteList(name: template.name, isBuiltIn: true, sortOrder: index)
-                    try list.insert(db)
-
-                    for (domainIndex, domain) in template.domains.enumerated() {
-                        var listDomain = SiteListDomain(
-                            siteListID: list.id!,
-                            domain: domain,
-                            sortOrder: domainIndex
-                        )
-                        try listDomain.insert(db)
-                    }
-                }
-            }
+            try seedDefaultSiteLists(in: db)
         }
         migrator.registerMigration("v7_disable_global_website_mode") { db in
             try db.execute(sql: "UPDATE profiles SET globalMode = 'blacklist'")
@@ -208,109 +181,88 @@ final class DataStore: @unchecked Sendable {
         return q
     }
 
+    private static func seedDefaultPayloadPatterns(in db: Database) throws {
+        let count = try PayloadPattern.fetchCount(db)
+        if count > 0 { return }
+
+        for (index, item) in PayloadProtectionDefaults.recommendedPatterns.enumerated() {
+            var pattern = PayloadPattern(
+                name: item.name,
+                regex: item.regex,
+                isEnabled: true,
+                isRecommended: true,
+                sortOrder: index
+            )
+            try pattern.insert(db)
+        }
+    }
+
+    private static func seedDefaultSiteLists(in db: Database) throws {
+        let count = try SiteList.fetchCount(db)
+        if count > 0 { return }
+
+        for (index, template) in DefaultCategories.all.enumerated() {
+            var list = SiteList(name: template.name, isBuiltIn: true, sortOrder: index)
+            try list.insert(db)
+
+            for (domainIndex, domain) in template.domains.enumerated() {
+                var listDomain = SiteListDomain(
+                    siteListID: list.id!,
+                    domain: domain,
+                    sortOrder: domainIndex
+                )
+                try listDomain.insert(db)
+            }
+        }
+    }
+
+    private static func seedDefaultProfileState(in db: Database) throws {
+        let profileCount = try BlockProfile.fetchCount(db)
+
+        if profileCount == 0 {
+            var defaultProfile = BlockProfile(
+                name: "Default Profile",
+                icon: "shield.fill",
+                color: "#007AFF",
+                globalMode: .blacklist,
+                sortOrder: 0
+            )
+            try defaultProfile.insert(db)
+
+            let settings = AppSettings(masterEnabled: false, activeProfileID: defaultProfile.id)
+            try settings.insert(db)
+            return
+        }
+
+        guard try AppSettings.fetchOne(db) == nil else { return }
+        let firstProfile = try BlockProfile.order(Column("sortOrder"), Column("id")).fetchOne(db)
+        let settings = AppSettings(masterEnabled: false, activeProfileID: firstProfile?.id)
+        try settings.insert(db)
+    }
 
     // MARK: - Seed Default Data
 
     private func seedIfEmpty() throws {
         try dbQueue.write { db in
-            let count = try BlockProfile.fetchCount(db)
-            if count > 0 { return }
+            try Self.seedDefaultProfileState(in: db)
+        }
+    }
 
-            // --- Work Mode (whitelist: only allow work-related sites) ---
-            var workProfile = BlockProfile(name: "Work Mode", icon: "briefcase.fill",
-                                           color: "#34C759", globalMode: .whitelist, sortOrder: 0)
-            try workProfile.insert(db)
-            let workID = workProfile.id!
+    func resetAllData() {
+        try? dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM domain_rules")
+            try db.execute(sql: "DELETE FROM app_rules")
+            try db.execute(sql: "DELETE FROM custom_groups")
+            try db.execute(sql: "DELETE FROM profiles")
+            try db.execute(sql: "DELETE FROM settings")
+            try db.execute(sql: "DELETE FROM site_list_domains")
+            try db.execute(sql: "DELETE FROM site_lists")
+            try db.execute(sql: "DELETE FROM payload_patterns")
+            try db.execute(sql: "DELETE FROM sqlite_sequence")
 
-            let workDomains = [
-                "google.com", "www.google.com", "docs.google.com",
-                "drive.google.com", "mail.google.com", "calendar.google.com",
-                "github.com", "www.github.com", "api.github.com",
-                "stackoverflow.com", "www.stackoverflow.com",
-                "notion.so", "www.notion.so",
-                "linear.app", "figma.com", "www.figma.com",
-                "vercel.com", "www.vercel.com",
-                "npmjs.com", "www.npmjs.com", "registry.npmjs.org",
-                "crates.io", "pub.dev",
-            ]
-            for domain in workDomains {
-                var rule = DomainRule(profileID: workID, domain: domain)
-                try rule.insert(db)
-            }
-
-            // Work Mode — CLI rules: curl can only reach work domains
-            var curlRule = AppRule(profileID: workID, appName: "curl",
-                                   bundleIdentifier: "com.apple.curl",
-                                   executablePath: "/usr/bin/curl",
-                                   ruleType: .cliTool, isBlocked: false, filterMode: .whitelist)
-            try curlRule.insert(db)
-            let curlID = curlRule.id!
-            let curlAllowedDomains = ["api.github.com", "registry.npmjs.org", "crates.io"]
-            for domain in curlAllowedDomains {
-                var r = DomainRule(profileID: workID, appRuleID: curlID, domain: domain)
-                try r.insert(db)
-            }
-
-            // Work Mode — Safari: inherit global (already whitelisted to work domains)
-            var safariRule = AppRule(profileID: workID, appName: "Safari",
-                                     bundleIdentifier: "com.apple.Safari",
-                                     ruleType: .guiApp, isBlocked: false, filterMode: .inheritGlobal)
-            try safariRule.insert(db)
-
-            // --- Study Mode (blacklist: block distractions) ---
-            var studyProfile = BlockProfile(name: "Study Mode", icon: "book.fill",
-                                             color: "#FF9500", globalMode: .blacklist, sortOrder: 1)
-            try studyProfile.insert(db)
-            let studyID = studyProfile.id!
-
-            for cat in DefaultCategories.all {
-                for domain in cat.domains {
-                    let parts = domain.split(separator: ".")
-                    let groupName: String
-                    if parts.count >= 2 {
-                        // Extract base domain name (e.g. "facebook" from "m.facebook.com")
-                        let base = String(parts[parts.count - 2])
-                        // Handle special cases like "co.uk" where we need the part before
-                        if (base == "co" || base == "com") && parts.count >= 3 {
-                            groupName = String(parts[parts.count - 3]).capitalized
-                        } else {
-                            groupName = base.capitalized
-                        }
-                    } else {
-                        groupName = "Other"
-                    }
-                    
-                    let groupID: Int64
-                    if let existing = try CustomDomainGroup
-                        .filter(Column("profileID") == studyID && Column("name") == groupName)
-                        .fetchOne(db) {
-                        groupID = existing.id!
-                    } else {
-                        var newGroup = CustomDomainGroup(profileID: studyID, name: groupName)
-                        try newGroup.insert(db)
-                        groupID = newGroup.id!
-                    }
-                    
-                    var rule = DomainRule(profileID: studyID, groupID: groupID, domain: domain)
-                    try rule.insert(db)
-                }
-            }
-            for app in DefaultApps.games + DefaultApps.messaging + DefaultApps.media {
-                var appRule = AppRule(profileID: studyID, appName: app.name,
-                                      bundleIdentifier: app.bundleID,
-                                      executablePath: app.executablePath,
-                                      ruleType: app.ruleType, isBlocked: true, filterMode: .inheritGlobal)
-                try appRule.insert(db)
-            }
-
-            // --- Break (nothing blocked) ---
-            var breakProfile = BlockProfile(name: "Break", icon: "cup.and.saucer.fill",
-                                             color: "#5856D6", globalMode: .blacklist, sortOrder: 2)
-            try breakProfile.insert(db)
-
-            // Default settings
-            let settings = AppSettings(masterEnabled: false, activeProfileID: nil)
-            try settings.insert(db)
+            try Self.seedDefaultPayloadPatterns(in: db)
+            try Self.seedDefaultSiteLists(in: db)
+            try Self.seedDefaultProfileState(in: db)
         }
     }
 

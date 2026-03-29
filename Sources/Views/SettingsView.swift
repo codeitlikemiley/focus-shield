@@ -8,6 +8,7 @@ struct SettingsView: View {
     @State private var newPatternName = ""
     @State private var newPatternRegex = ""
     @State private var payloadValidationError: String?
+    @State private var showResetConfirmation = false
 
     var body: some View {
         Form {
@@ -173,9 +174,32 @@ struct SettingsView: View {
                 LabeledContent("Database", value: "SQLite (GRDB.swift)")
                 LabeledContent("Build", value: "Focus Shield v2 — Granular Blocking Edition")
             }
+
+            Section("Data") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Reset Focus Shield")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("Deletes all profiles, app rules, CLI rules, custom site lists, domains, and custom payload patterns. Built-in site lists and one empty default profile are recreated.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Button("Reset All Data", role: .destructive) {
+                        showResetConfirmation = true
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(vm.isProcessing)
+                }
+            }
         }
         .formStyle(.grouped)
         .navigationTitle("Settings")
+        .alert("Reset Focus Shield data?", isPresented: $showResetConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset", role: .destructive) {
+                Task { await vm.resetAllData() }
+            }
+        } message: {
+            Text("This returns the app to a fresh-install state with one empty default profile.")
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             checkPermissions()
             vm.refreshNetworkFilterStatus(force: true)

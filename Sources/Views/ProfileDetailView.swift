@@ -105,7 +105,22 @@ struct ProfileDetailView: View {
 
     private var statsGrid: some View {
         let rules = profileWithRules
+        let appRuleCount = rules?.totalAppRulesCount ?? 0
+        let cliRuleCount = rules?.totalCLIRulesCount ?? 0
+        let attachedSiteCount = rules?.totalEnabledDomains ?? 0
+        let hasNoProfileData = appRuleCount == 0 && cliRuleCount == 0 && attachedSiteCount == 0
+
         return LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+            if hasNoProfileData {
+                EmptyProfileCard(
+                    templateCount: siteListCount,
+                    openLists: openLists,
+                    openApps: { selectedTab = .apps },
+                    openCLI: { selectedTab = .cli }
+                )
+                .gridCellColumns(2)
+            }
+
             StatCard(
                 title: "Templates",
                 value: "\(siteListCount)",
@@ -115,25 +130,55 @@ struct ProfileDetailView: View {
 
             StatCard(
                 title: "App Rules",
-                value: "\(rules?.totalAppRulesCount ?? 0)",
+                value: "\(appRuleCount)",
                 systemImage: "app.badge",
                 color: .orange
             ) { selectedTab = .apps }
 
             StatCard(
                 title: "CLI Rules",
-                value: "\(rules?.totalCLIRulesCount ?? 0)",
+                value: "\(cliRuleCount)",
                 systemImage: "terminal.fill",
                 color: .purple
             ) { selectedTab = .cli }
 
             StatCard(
                 title: "Attached Sites",
-                value: "\(rules?.totalEnabledDomains ?? 0)",
+                value: "\(attachedSiteCount)",
                 systemImage: "globe",
                 color: .red
             ) { selectedTab = .apps }
         }
+    }
+}
+
+private struct EmptyProfileCard: View {
+    let templateCount: Int
+    let openLists: () -> Void
+    let openApps: () -> Void
+    let openCLI: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("No data yet.", systemImage: "sparkles.rectangle.stack")
+                .font(.system(size: 14, weight: .semibold))
+
+            Text("This default profile starts empty. Add an app rule, add a CLI tool, or import one of the \(templateCount) built-in site lists to get started.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Button("Open Apps", action: openApps)
+                    .buttonStyle(.borderedProminent)
+                Button("Open CLI", action: openCLI)
+                    .buttonStyle(.bordered)
+                Button("Browse Lists", action: openLists)
+                    .buttonStyle(.bordered)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 

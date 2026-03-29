@@ -481,6 +481,50 @@ final class FocusShieldViewModel {
         reloadPayloadPatterns()
     }
 
+    func resetAllData() async {
+        isProcessing = true
+        errorMessage = nil
+
+        #if os(macOS)
+        appMonitor.updateBlockedApps([])
+        appMonitor.updateBlockedCLIs([])
+
+        do {
+            try await NetworkFilterManagerService.shared.disable()
+        } catch {
+            neLogger.error("Failed to disable network filter during reset: \(error.localizedDescription, privacy: .public)")
+        }
+
+        do {
+            try await HostsFileService.removeAllEntries()
+        } catch {
+            neLogger.error("Failed to remove host/pf/PAC entries during reset: \(error.localizedDescription, privacy: .public)")
+        }
+
+        updateNetworkFilterState(.inactive)
+        hasPendingBrowserRestart = false
+        runningBrowserNames = []
+        runningBrowserBundleIDs = []
+        #endif
+
+        store.resetAllData()
+
+        settings = store.loadSettings()
+        profiles = store.fetchAllProfiles()
+        activeProfile = settings.activeProfileID.flatMap { store.fetchProfileWithRules(id: $0) }
+        siteLists = store.fetchSiteListsWithDomains()
+        payloadPatterns = store.fetchPayloadPatterns()
+        errorMessage = nil
+        isProcessing = false
+        notifyDataChanged()
+        syncPayloadProtectionConfiguration()
+
+        #if os(macOS)
+        refreshEnforcementHealth()
+        refreshNetworkFilterStatus(force: true)
+        #endif
+    }
+
     // MARK: - Blocking Enforcement
 
     func applyNetworkPolicy() {
