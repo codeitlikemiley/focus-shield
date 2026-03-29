@@ -9,12 +9,17 @@ struct RuleDomainEditorView: View {
     let onModeChange: (FilterMode) -> Void
     let onImport: () -> Void
     let onToggleRule: (Int64, Bool) -> Void
+    let onToggleAllRules: (Bool) -> Void
     let onDeleteRule: (Int64) -> Void
     let onAddDomain: (String, FilterMode) -> Void
 
     @State private var newDomain = ""
 
     var body: some View {
+        let allRules = displayedGroups.flatMap(\.rules)
+        let enabledRuleCount = allRules.filter(\.isEnabled).count
+        let allRulesEnabled = !allRules.isEmpty && enabledRuleCount == allRules.count
+
         Group {
             HStack {
                 Text("Domain Filter")
@@ -39,9 +44,27 @@ struct RuleDomainEditorView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("Switching modes changes which list you edit.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+                if allRules.isEmpty == false {
+                    HStack(spacing: 8) {
+                        Text("All Sites")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Toggle("", isOn: Binding(
+                            get: { allRulesEnabled },
+                            set: onToggleAllRules
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                        Text("\(enabledRuleCount)/\(allRules.count)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                    }
+                } else {
+                    Text("Switching modes changes which list you edit.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.leading, 16)
 

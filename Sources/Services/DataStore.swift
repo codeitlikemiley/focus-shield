@@ -538,6 +538,19 @@ final class DataStore: @unchecked Sendable {
         }
     }
 
+    func toggleDomainRules(ids: [Int64], enabled: Bool) {
+        let validIDs = ids.filter { $0 > 0 }
+        guard !validIDs.isEmpty else { return }
+        _ = try? dbQueue.write { db in
+            for id in validIDs {
+                try db.execute(
+                    sql: "UPDATE domain_rules SET isEnabled = ? WHERE id = ?",
+                    arguments: [enabled, id]
+                )
+            }
+        }
+    }
+
     func updateDomainRuleValue(id: Int64, domain: String) {
         _ = try? dbQueue.write { db in
             try db.execute(

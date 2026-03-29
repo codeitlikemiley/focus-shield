@@ -195,6 +195,10 @@ struct AppRulesTab: View {
                         onToggleRule: { id, isEnabled in
                             vm.toggleDomainRule(profileID: profileID, id: id, enabled: isEnabled)
                         },
+                        onToggleAllRules: { isEnabled in
+                            let ids = activeGroups.compactMap(\.rules).flatMap { $0 }.compactMap(\.id)
+                            vm.toggleDomainRules(profileID: profileID, ids: ids, enabled: isEnabled)
+                        },
                         onDeleteRule: { id in
                             vm.removeDomainRule(profileID: profileID, id: id)
                         },
@@ -307,21 +311,31 @@ struct AppRuleHeaderRow: View {
 
             Spacer()
 
-            // Block toggle — disabled when rule is unlinked
-            Toggle("Block", isOn: Binding(
-                get: { appRule.rule.isBlocked },
-                set: { blocked in
+            if appRule.rule.isBlocked {
+                Button("Unblock") {
                     if let id = appRule.rule.id {
-                        vm.toggleAppBlocked(profileID: profileID, id: id, blocked: blocked)
+                        vm.toggleAppBlocked(profileID: profileID, id: id, blocked: false)
                     }
                 }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .labelsHidden()
-            .help(appRule.rule.isBlocked ? "Unblock app" : "Block app entirely")
-            .disabled(!isLinked)
-            .opacity(isLinked ? 1 : 0.4)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.secondary)
+                .disabled(!isLinked)
+                .help("Unblock app")
+                .opacity(isLinked ? 1 : 0.4)
+            } else {
+                Button("Block") {
+                    if let id = appRule.rule.id {
+                        vm.toggleAppBlocked(profileID: profileID, id: id, blocked: true)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.red)
+                .disabled(!isLinked)
+                .help("Block app entirely")
+                .opacity(isLinked ? 1 : 0.4)
+            }
 
             // Unlink / Link button
             Button {

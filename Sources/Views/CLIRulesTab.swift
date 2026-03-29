@@ -142,6 +142,10 @@ struct CLIRulesTab: View {
                     onToggleRule: { id, isEnabled in
                         vm.toggleDomainRule(profileID: profileID, id: id, enabled: isEnabled)
                     },
+                    onToggleAllRules: { isEnabled in
+                        let ids = activeGroups.compactMap(\.rules).flatMap { $0 }.compactMap(\.id)
+                        vm.toggleDomainRules(profileID: profileID, ids: ids, enabled: isEnabled)
+                    },
                     onDeleteRule: { id in
                         vm.removeDomainRule(profileID: profileID, id: id)
                     },
@@ -236,20 +240,31 @@ struct CLIRuleHeaderRow: View {
 
             Spacer()
 
-            Toggle("Block", isOn: Binding(
-                get: { cliRule.rule.isBlocked },
-                set: { blocked in
+            if cliRule.rule.isBlocked {
+                Button("Unblock") {
                     if let id = cliRule.rule.id {
-                        vm.toggleCLIBlocked(profileID: profileID, id: id, blocked: blocked)
+                        vm.toggleCLIBlocked(profileID: profileID, id: id, blocked: false)
                     }
                 }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .labelsHidden()
-            .help(cliRule.rule.isBlocked ? "Unblock all traffic" : "Block all network traffic")
-            .disabled(!isLinked)
-            .opacity(isLinked ? 1 : 0.4)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.secondary)
+                .disabled(!isLinked)
+                .help("Unblock all traffic")
+                .opacity(isLinked ? 1 : 0.4)
+            } else {
+                Button("Block") {
+                    if let id = cliRule.rule.id {
+                        vm.toggleCLIBlocked(profileID: profileID, id: id, blocked: true)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.red)
+                .disabled(!isLinked)
+                .help("Block all network traffic")
+                .opacity(isLinked ? 1 : 0.4)
+            }
 
             // Unlink / Link button
             Button {

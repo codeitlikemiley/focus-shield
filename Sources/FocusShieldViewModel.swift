@@ -389,6 +389,17 @@ final class FocusShieldViewModel {
         if shouldPromptForBrowserRestart(domainRule: domainRule) { noteBrowserPolicyChange() }
     }
 
+    func toggleDomainRules(profileID: Int64, ids: [Int64], enabled: Bool) {
+        let validIDs = ids.filter { $0 > 0 }
+        guard !validIDs.isEmpty else { return }
+        let affectedRules = validIDs.compactMap { store.fetchDomainRule(id: $0) }
+        store.toggleDomainRules(ids: validIDs, enabled: enabled)
+        reloadAndApply(profileID: profileID)
+        if affectedRules.contains(where: { shouldPromptForBrowserRestart(domainRule: $0) }) {
+            noteBrowserPolicyChange()
+        }
+    }
+
     func changeDomainGroup(profileID: Int64, ruleID: Int64, newGroupID: Int64?) {
         store.updateDomainRuleGroup(id: ruleID, groupID: newGroupID)
         reloadAndApply(profileID: profileID)
