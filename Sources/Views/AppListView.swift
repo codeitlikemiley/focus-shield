@@ -11,8 +11,6 @@ struct AppRulesTab: View {
     @State private var showAddApp = false
     @State private var showBrowseApps = false
     @State private var importSiteListRule: AppRuleImportTarget?
-    @State private var newDomain = ""
-    @State private var addDomainForRuleID: Int64? = nil
 
     @State private var profileWithRules: ProfileWithRules?
 
@@ -122,7 +120,12 @@ struct AppRulesTab: View {
             AddAppSheet(profileID: profileID)
         }
         .sheet(item: $importSiteListRule) { target in
-            ImportSiteListSheet(profileID: profileID, appRuleID: target.ruleID, title: target.title)
+            ImportSiteListSheet(
+                profileID: profileID,
+                appRuleID: target.ruleID,
+                title: target.title,
+                filterMode: target.filterMode
+            )
         }
         .onAppear {
             profileWithRules = vm.fetchProfileWithRules(id: profileID)
@@ -163,91 +166,44 @@ struct AppRulesTab: View {
     private func appRuleSection(_ appRule: AppRuleWithDomains) -> some View {
         let ruleID: Int64? = appRule.rule.id
         let isExpanded: Bool = expandedRuleID != nil && expandedRuleID == ruleID
+        let activeMode = appRule.effectiveFilterMode(globalMode: .blacklist)
         Section {
             if isExpanded {
                 if appRule.supportsPerAppDomainFiltering {
-                    HStack {
-                        Text("Domain Filter")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Picker("", selection: Binding(
-                            get: { appRule.rule.filterMode },
-                            set: { mode in
-                                if let id = ruleID {
-                                    vm.setAppFilterMode(profileID: profileID, id: id, filterMode: mode)
-                                }
-                            }
-                        )) {
-                            SwiftUI.ForEach(FilterMode.directModes, id: \.self) { mode in
-                                Text(mode.label).tag(mode)
-                            }
+                    RuleDomainEditorView(
+                        currentMode: activeMode,
+                        displayedRules: appRule.domainRules(for: activeMode),
+                        whitelistCount: appRule.domainCount(for: .whitelist),
+                        blacklistCount: appRule.domainCount(for: .blacklist),
+                        addPlaceholder: "Add facebook.com, m.facebook.com, or *.facebook.com",
+                        onModeChange: { mode in
+                            guard let id = ruleID else { return }
+                            vm.setAppFilterMode(profileID: profileID, id: id, filterMode: mode)
+                        },
+                        onImport: {
+                            guard let ruleID else { return }
+                            importSiteListRule = AppRuleImportTarget(
+                                ruleID: ruleID,
+                                title: appRule.rule.appName,
+                                filterMode: activeMode
+                            )
+                        },
+                        onToggleRule: { id, isEnabled in
+                            vm.toggleDomainRule(profileID: profileID, id: id, enabled: isEnabled)
+                        },
+                        onDeleteRule: { id in
+                            vm.removeDomainRule(profileID: profileID, id: id)
+                        },
+                        onAddDomain: { domain, mode in
+                            guard let ruleID else { return }
+                            vm.addDomainRule(
+                                profileID: profileID,
+                                domain: domain,
+                                appRuleID: ruleID,
+                                filterMode: mode
+                            )
                         }
-                        .pickerStyle(.menu)
-                        .controlSize(.small)
-                    }
-                    .padding(.leading, 16)
-
-                    HStack {
-                        Text("Templates")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Import Site List…") {
-                            if let ruleID {
-                                importSiteListRule = AppRuleImportTarget(ruleID: ruleID, title: appRule.rule.appName)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.leading, 16)
-
-                    SwiftUI.ForEach(appRule.domainRules, id: \.id) { domainRule in
-                        HStack {
-                            Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
-                                .foregroundStyle(.secondary)
-                                .frame(width: 16)
-                            Text(domainRule.domain).font(.system(size: 12))
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { domainRule.isEnabled },
-                                set: { on in
-                                    if let id = domainRule.id {
-                                        vm.toggleDomainRule(profileID: profileID, id: id, enabled: on)
-                                    }
-                                }
-                            ))
-                            .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                            Button(role: .destructive) {
-                                if let id = domainRule.id {
-                                    vm.removeDomainRule(profileID: profileID, id: id)
-                                }
-                            } label: {
-                                Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.leading, 32)
-                    }
-
-                    HStack {
-                        Image(systemName: "plus.circle").foregroundStyle(Color.accentColor).frame(width: 16)
-                        TextField("Add domain for \(appRule.rule.appName)…",
-                                  text: Binding(
-                                    get: { addDomainForRuleID == ruleID ? newDomain : "" },
-                                    set: { newDomain = $0; addDomainForRuleID = ruleID }
-                                  ))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12))
-                        .onSubmit {
-                            if !newDomain.isEmpty, let rID = ruleID {
-                                vm.addDomainRule(profileID: profileID, domain: newDomain, appRuleID: rID)
-                                newDomain = ""
-                                addDomainForRuleID = nil
-                            }
-                        }
-                    }
-                    .padding(.leading, 32)
+                    )
                 } else {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -331,7 +287,10 @@ struct AppRuleHeaderRow: View {
                             .foregroundStyle(.secondary)
                     } else if !appRule.domainRules.isEmpty {
                         let mode = appRule.effectiveFilterMode(globalMode: .blacklist)
-                        Label("\(appRule.domainRules.count) domain rules · \(mode.label)", systemImage: "list.bullet")
+                        let activeCount = appRule.domainCount(for: mode)
+                        let otherMode: FilterMode = mode == .whitelist ? .blacklist : .whitelist
+                        let otherCount = appRule.domainCount(for: otherMode)
+                        Label("\(activeCount) \(mode.label.lowercased()) · \(otherCount) \(otherMode.label.lowercased())", systemImage: "list.bullet")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     } else {
@@ -386,6 +345,7 @@ struct AppRuleHeaderRow: View {
 struct AppRuleImportTarget: Identifiable {
     let ruleID: Int64
     let title: String
+    let filterMode: FilterMode
 
     var id: Int64 { ruleID }
 }

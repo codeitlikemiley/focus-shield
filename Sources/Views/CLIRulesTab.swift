@@ -10,8 +10,6 @@ struct CLIRulesTab: View {
     @State private var showAddCLI = false
     @State private var importSiteListRule: AppRuleImportTarget?
     @State private var searchText = ""
-    @State private var newDomain = ""
-    @State private var addDomainForRuleID: Int64? = nil
 
     @State private var profileWithRules: ProfileWithRules?
 
@@ -61,7 +59,12 @@ struct CLIRulesTab: View {
             AddCLIRuleSheet(profileID: profileID)
         }
         .sheet(item: $importSiteListRule) { target in
-            ImportSiteListSheet(profileID: profileID, appRuleID: target.ruleID, title: target.title)
+            ImportSiteListSheet(
+                profileID: profileID,
+                appRuleID: target.ruleID,
+                title: target.title,
+                filterMode: target.filterMode
+            )
         }
         .onAppear {
             profileWithRules = vm.fetchProfileWithRules(id: profileID)
@@ -102,6 +105,7 @@ struct CLIRulesTab: View {
     private func cliRuleSection(_ cliRule: AppRuleWithDomains) -> some View {
         let ruleID: Int64? = cliRule.rule.id
         let isExpanded: Bool = expandedRuleID != nil && expandedRuleID == ruleID
+        let activeMode = cliRule.effectiveFilterMode(globalMode: .blacklist)
         Section {
             if isExpanded {
                 // Executable path info
@@ -113,90 +117,40 @@ struct CLIRulesTab: View {
                 }
                 .padding(.leading, 16)
 
-                // Filter mode picker
-                HStack {
-                    Text("Domain Filter")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Picker("", selection: Binding(
-                        get: { cliRule.rule.filterMode },
-                        set: { mode in
-                            if let id = ruleID {
-                                vm.setCLIFilterMode(profileID: profileID, id: id, filterMode: mode)
-                            }
-                        }
-                    )) {
-                        SwiftUI.ForEach(FilterMode.directModes, id: \.self) { mode in
-                            Text(mode.label).tag(mode)
-                        }
+                RuleDomainEditorView(
+                    currentMode: activeMode,
+                    displayedRules: cliRule.domainRules(for: activeMode),
+                    whitelistCount: cliRule.domainCount(for: .whitelist),
+                    blacklistCount: cliRule.domainCount(for: .blacklist),
+                    addPlaceholder: "Add api.example.com or *.example.com",
+                    onModeChange: { mode in
+                        guard let id = ruleID else { return }
+                        vm.setCLIFilterMode(profileID: profileID, id: id, filterMode: mode)
+                    },
+                    onImport: {
+                        guard let ruleID else { return }
+                        importSiteListRule = AppRuleImportTarget(
+                            ruleID: ruleID,
+                            title: cliRule.rule.appName,
+                            filterMode: activeMode
+                        )
+                    },
+                    onToggleRule: { id, isEnabled in
+                        vm.toggleDomainRule(profileID: profileID, id: id, enabled: isEnabled)
+                    },
+                    onDeleteRule: { id in
+                        vm.removeDomainRule(profileID: profileID, id: id)
+                    },
+                    onAddDomain: { domain, mode in
+                        guard let ruleID else { return }
+                        vm.addDomainRule(
+                            profileID: profileID,
+                            domain: domain,
+                            appRuleID: ruleID,
+                            filterMode: mode
+                        )
                     }
-                    .pickerStyle(.menu)
-                    .controlSize(.small)
-                }
-                .padding(.leading, 16)
-
-                HStack {
-                    Text("Templates")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Import Site List…") {
-                        if let ruleID {
-                            importSiteListRule = AppRuleImportTarget(ruleID: ruleID, title: cliRule.rule.appName)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.leading, 16)
-
-                // Per-CLI domain rules
-                SwiftUI.ForEach(cliRule.domainRules, id: \.id) { domainRule in
-                    HStack {
-                        Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 16)
-                        Text(domainRule.domain).font(.system(size: 12))
-                        Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { domainRule.isEnabled },
-                            set: { on in
-                                if let id = domainRule.id {
-                                    vm.toggleDomainRule(profileID: profileID, id: id, enabled: on)
-                                }
-                            }
-                        ))
-                        .toggleStyle(.switch).controlSize(.mini).labelsHidden()
-                        Button(role: .destructive) {
-                            if let id = domainRule.id {
-                                vm.removeDomainRule(profileID: profileID, id: id)
-                            }
-                        } label: {
-                            Image(systemName: "trash").foregroundStyle(.red.opacity(0.7))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.leading, 32)
-                }
-
-                // Add domain
-                HStack {
-                    Image(systemName: "plus.circle").foregroundStyle(Color.accentColor).frame(width: 16)
-                    TextField("Add allowed/blocked domain…", text: Binding(
-                        get: { addDomainForRuleID == ruleID ? newDomain : "" },
-                        set: { newDomain = $0; addDomainForRuleID = ruleID }
-                    ))
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .onSubmit {
-                        if !newDomain.isEmpty, let rID = ruleID {
-                            vm.addDomainRule(profileID: profileID, domain: newDomain, appRuleID: rID)
-                            newDomain = ""
-                            addDomainForRuleID = nil
-                        }
-                    }
-                }
-                .padding(.leading, 32)
+                )
             }
         } header: {
             CLIRuleHeaderRow(
@@ -262,7 +216,10 @@ struct CLIRuleHeaderRow: View {
                             .foregroundStyle(.red)
                     } else if !cliRule.domainRules.isEmpty {
                         let mode = cliRule.effectiveFilterMode(globalMode: .blacklist)
-                        Label("\(cliRule.domainRules.count) domains · \(mode.label)", systemImage: "list.bullet")
+                        let activeCount = cliRule.domainCount(for: mode)
+                        let otherMode: FilterMode = mode == .whitelist ? .blacklist : .whitelist
+                        let otherCount = cliRule.domainCount(for: otherMode)
+                        Label("\(activeCount) \(mode.label.lowercased()) · \(otherCount) \(otherMode.label.lowercased())", systemImage: "list.bullet")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                     } else {

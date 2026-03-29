@@ -58,6 +58,7 @@ final class DataStore: @unchecked Sendable {
                 t.column("profileID", .integer).notNull().references("profiles", onDelete: .cascade)
                 t.column("appRuleID", .integer).references("app_rules", onDelete: .cascade)
                 t.column("domain", .text).notNull()
+                t.column("filterMode", .text).notNull().defaults(to: "blacklist")
                 t.column("isEnabled", .boolean).notNull().defaults(to: true)
             }
             try db.create(table: "settings", ifNotExists: true) { t in
@@ -168,6 +169,40 @@ final class DataStore: @unchecked Sendable {
             if !cols.contains("isEnabled") {
                 try db.alter(table: "app_rules") { t in t.add(column: "isEnabled", .boolean).defaults(to: true) }
             }
+        }
+        migrator.registerMigration("v10_add_domain_rule_modes") { db in
+            let cols = try db.columns(in: "domain_rules").map { $0.name }
+            if !cols.contains("filterMode") {
+                try db.alter(table: "domain_rules") { t in
+                    t.add(column: "filterMode", .text).defaults(to: "blacklist")
+                }
+            }
+
+            try db.execute(
+                sql: """
+                UPDATE domain_rules
+                SET filterMode = 'blacklist'
+                WHERE filterMode IS NULL OR filterMode NOT IN ('blacklist', 'whitelist')
+                """
+            )
+
+            try db.execute(
+                sql: """
+                UPDATE domain_rules
+                SET filterMode = COALESCE(
+                    (
+                        SELECT CASE
+                            WHEN app_rules.filterMode = 'whitelist' THEN 'whitelist'
+                            ELSE 'blacklist'
+                        END
+                        FROM app_rules
+                        WHERE app_rules.id = domain_rules.appRuleID
+                    ),
+                    filterMode
+                )
+                WHERE appRuleID IS NOT NULL
+                """
+            )
         }
         try migrator.migrate(q)
         return q
@@ -379,15 +414,34 @@ final class DataStore: @unchecked Sendable {
         _ = try? dbQueue.write { db in try SiteListDomain.deleteOne(db, key: id) }
     }
 
+    func updateSiteListDomain(id: Int64, domain: String) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE site_list_domains SET domain = ? WHERE id = ?",
+                arguments: [domain, id]
+            )
+        }
+    }
+
     func addSiteListDomains(siteListID: Int64, domains: [String]) {
         _ = try? dbQueue.write { db in
+            var existingDomains = Set(
+                try SiteListDomain
+                    .filter(Column("siteListID") == siteListID)
+                    .fetchAll(db)
+                    .map { $0.domain.lowercased() }
+            )
             let existingCount = try SiteListDomain
                 .filter(Column("siteListID") == siteListID)
                 .fetchCount(db)
+            var insertedCount = 0
 
-            for (offset, domain) in domains.enumerated() {
-                var item = SiteListDomain(siteListID: siteListID, domain: domain, sortOrder: existingCount + offset)
+            for domain in domains {
+                let normalized = domain.lowercased()
+                guard existingDomains.insert(normalized).inserted else { continue }
+                var item = SiteListDomain(siteListID: siteListID, domain: domain, sortOrder: existingCount + insertedCount)
                 try item.insert(db)
+                insertedCount += 1
             }
         }
     }
@@ -473,13 +527,17 @@ final class DataStore: @unchecked Sendable {
         (try? dbQueue.read { db in
             try DomainRule
                 .filter(Column("profileID") == profileID && Column("appRuleID") == nil)
+                .order(Column("filterMode"), Column("domain"))
                 .fetchAll(db)
         }) ?? []
     }
 
     func fetchDomainRules(appRuleID: Int64) -> [DomainRule] {
         (try? dbQueue.read { db in
-            try DomainRule.filter(Column("appRuleID") == appRuleID).fetchAll(db)
+            try DomainRule
+                .filter(Column("appRuleID") == appRuleID)
+                .order(Column("filterMode"), Column("domain"))
+                .fetchAll(db)
         }) ?? []
     }
 
@@ -505,6 +563,15 @@ final class DataStore: @unchecked Sendable {
                            arguments: [enabled, id])
         }
     }
+
+    func updateDomainRuleValue(id: Int64, domain: String) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE domain_rules SET domain = ? WHERE id = ?",
+                arguments: [domain, id]
+            )
+        }
+    }
     
     func updateDomainRuleGroup(id: Int64, groupID: Int64?) {
         _ = try? dbQueue.write { db in
@@ -513,10 +580,33 @@ final class DataStore: @unchecked Sendable {
         }
     }
 
-    func addDomainRules(profileID: Int64, appRuleID: Int64? = nil, groupID: Int64? = nil, domains: [String]) {
+    func addDomainRules(
+        profileID: Int64,
+        appRuleID: Int64? = nil,
+        groupID: Int64? = nil,
+        filterMode: FilterMode = .blacklist,
+        domains: [String]
+    ) {
         _ = try? dbQueue.write { db in
+            var existingDomains = Set(
+                try DomainRule
+                    .filter(Column("profileID") == profileID)
+                    .filter(Column("appRuleID") == appRuleID)
+                    .filter(Column("filterMode") == filterMode.rawValue)
+                    .fetchAll(db)
+                    .map { $0.domain.lowercased() }
+            )
+
             for domain in domains {
-                var rule = DomainRule(profileID: profileID, appRuleID: appRuleID, groupID: groupID, domain: domain)
+                let normalized = domain.lowercased()
+                guard existingDomains.insert(normalized).inserted else { continue }
+                var rule = DomainRule(
+                    profileID: profileID,
+                    appRuleID: appRuleID,
+                    groupID: groupID,
+                    domain: domain,
+                    filterMode: filterMode
+                )
                 try rule.insert(db)
             }
         }

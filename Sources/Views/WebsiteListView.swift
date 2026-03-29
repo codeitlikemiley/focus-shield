@@ -10,6 +10,8 @@ struct GlobalRulesTab: View {
     @State private var showAddList = false
     @State private var addDomainForListID: Int64?
     @State private var newDomain = ""
+    @State private var editingDomainID: Int64?
+    @State private var editingDomainText = ""
 
     var filteredLists: [SiteListWithDomains] {
         guard !searchText.isEmpty else { return vm.siteLists }
@@ -64,7 +66,10 @@ struct GlobalRulesTab: View {
             }
         }
         .sheet(isPresented: $showAddList) {
-            AddSiteListSheet()
+            AddSiteListSheet { newListID in
+                expandedListIDs.insert(newListID)
+                addDomainForListID = newListID
+            }
         }
     }
 
@@ -93,28 +98,79 @@ struct GlobalRulesTab: View {
 
                 Section {
                     if isExpanded {
-                        ForEach(siteList.domains, id: \.id) { domain in
-                            HStack(spacing: 8) {
-                                Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                        if siteList.domains.isEmpty, !siteList.list.isBuiltIn {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: "square.and.pencil")
                                     .foregroundStyle(.secondary)
                                     .frame(width: 18)
-                                Text(domain.domain)
-                                    .font(.system(size: 13))
-                                    .textSelection(.enabled)
+                                Text("No domains yet. Add `facebook.com`, `m.facebook.com`, or `*.facebook.com` below.")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
                                 Spacer()
-                                if !siteList.list.isBuiltIn {
-                                    Button(role: .destructive) {
-                                        if let id = domain.id {
-                                            vm.removeDomainFromSiteList(id: id)
+                            }
+                            .padding(.leading, 20)
+                        }
+
+                        ForEach(siteList.domains, id: \.id) { domain in
+                            let domainID = domain.id ?? -1
+                            if editingDomainID == domainID, !siteList.list.isBuiltIn {
+                                HStack(spacing: 8) {
+                                    Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 18)
+                                    TextField("Edit domain", text: $editingDomainText)
+                                        .textFieldStyle(.plain)
+                                        .font(.system(size: 13))
+                                        .onSubmit {
+                                            guard let id = domain.id else { return }
+                                            vm.updateSiteListDomain(id: id, domain: editingDomainText)
+                                            editingDomainID = nil
+                                            editingDomainText = ""
                                         }
-                                    } label: {
-                                        Image(systemName: "trash")
-                                            .foregroundStyle(.red.opacity(0.7))
+                                    Button("Save") {
+                                        guard let id = domain.id else { return }
+                                        vm.updateSiteListDomain(id: id, domain: editingDomainText)
+                                        editingDomainID = nil
+                                        editingDomainText = ""
+                                    }
+                                    .buttonStyle(.plain)
+                                    Button("Cancel") {
+                                        editingDomainID = nil
+                                        editingDomainText = ""
                                     }
                                     .buttonStyle(.plain)
                                 }
+                                .padding(.leading, 20)
+                            } else {
+                                HStack(spacing: 8) {
+                                    Image(systemName: domain.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 18)
+                                    Text(domain.domain)
+                                        .font(.system(size: 13))
+                                        .textSelection(.enabled)
+                                    Spacer()
+                                    if !siteList.list.isBuiltIn {
+                                        Button {
+                                            editingDomainID = domainID
+                                            editingDomainText = domain.domain
+                                        } label: {
+                                            Image(systemName: "pencil")
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        .buttonStyle(.plain)
+                                        Button(role: .destructive) {
+                                            guard let id = domain.id else { return }
+                                            vm.removeDomainFromSiteList(id: id)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                                .foregroundStyle(.red.opacity(0.7))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.leading, 20)
                             }
-                            .padding(.leading, 20)
                         }
 
                         if !siteList.list.isBuiltIn {
@@ -123,7 +179,7 @@ struct GlobalRulesTab: View {
                                     .foregroundStyle(Color.accentColor)
                                     .frame(width: 18)
                                 TextField(
-                                    "Add domain or wildcard…",
+                                    "Add facebook.com, m.facebook.com, or *.facebook.com",
                                     text: Binding(
                                         get: { addDomainForListID == listID ? newDomain : "" },
                                         set: { newDomain = $0; addDomainForListID = listID }
@@ -205,6 +261,7 @@ struct GlobalRulesTab: View {
 struct AddSiteListSheet: View {
     @Environment(FocusShieldViewModel.self) private var vm
     @Environment(\.dismiss) private var dismiss
+    let onCreated: (Int64) -> Void
     @State private var name = ""
 
     var body: some View {
@@ -219,7 +276,9 @@ struct AddSiteListSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Create") {
-                    vm.addSiteList(name: name)
+                    if let id = vm.addSiteList(name: name) {
+                        onCreated(id)
+                    }
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
@@ -240,6 +299,7 @@ struct ImportSiteListSheet: View {
     let profileID: Int64
     let appRuleID: Int64
     let title: String
+    let filterMode: FilterMode
 
     @State private var selectedListID: Int64?
     @State private var selectedDomainIDs: Set<Int64> = []
@@ -253,6 +313,10 @@ struct ImportSiteListSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Import Into \(title)")
                 .font(.title2.weight(.bold))
+
+            Text("Imported domains are added to the \(filterMode.label.lowercased()) list for this rule only.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
 
             Picker("Template", selection: $selectedListID) {
                 Text("Select a site list").tag(Int64?.none)
@@ -313,7 +377,12 @@ struct ImportSiteListSheet: View {
                             return selectedDomainIDs.contains(id)
                         }
                         .map(\.domain)
-                    vm.importSiteDomains(profileID: profileID, appRuleID: appRuleID, domains: selectedDomains)
+                    vm.importSiteDomains(
+                        profileID: profileID,
+                        appRuleID: appRuleID,
+                        filterMode: filterMode,
+                        domains: selectedDomains
+                    )
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)

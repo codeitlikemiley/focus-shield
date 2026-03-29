@@ -262,13 +262,15 @@ final class FocusShieldViewModel {
 
     // MARK: - Site Lists
 
-    func addSiteList(name: String) {
+    @discardableResult
+    func addSiteList(name: String) -> Int64? {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanName.isEmpty else { return }
+        guard !cleanName.isEmpty else { return nil }
         let nextSortOrder = (siteLists.map { $0.list.sortOrder }.max() ?? -1) + 1
         var list = SiteList(name: cleanName, isBuiltIn: false, sortOrder: nextSortOrder)
         store.saveSiteList(&list)
         reloadSiteLists()
+        return list.id
     }
 
     func removeSiteList(id: Int64) {
@@ -283,31 +285,62 @@ final class FocusShieldViewModel {
         reloadSiteLists()
     }
 
+    func updateSiteListDomain(id: Int64, domain: String) {
+        let clean = cleanDomain(domain)
+        guard !clean.isEmpty else { return }
+        store.updateSiteListDomain(id: id, domain: clean)
+        reloadSiteLists()
+    }
+
     func removeDomainFromSiteList(id: Int64) {
         store.deleteSiteListDomain(id: id)
         reloadSiteLists()
     }
 
-    func importSiteDomains(profileID: Int64, appRuleID: Int64, domains: [String]) {
+    func importSiteDomains(profileID: Int64, appRuleID: Int64, filterMode: FilterMode, domains: [String]) {
         let clean = domains.map(cleanDomain).filter { !$0.isEmpty }
         guard !clean.isEmpty else { return }
-        store.addDomainRules(profileID: profileID, appRuleID: appRuleID, domains: clean)
+        store.addDomainRules(profileID: profileID, appRuleID: appRuleID, filterMode: filterMode, domains: clean)
         reloadAndApply(profileID: profileID)
         if shouldPromptForBrowserRestart(appRuleID: appRuleID) { noteBrowserPolicyChange() }
     }
 
     // MARK: - Global Domain Rule Actions (profileID-scoped)
 
-    func addDomainRule(profileID: Int64, domain: String, appRuleID: Int64? = nil, groupID: Int64? = nil) {
+    func addDomainRule(
+        profileID: Int64,
+        domain: String,
+        appRuleID: Int64? = nil,
+        groupID: Int64? = nil,
+        filterMode: FilterMode = .blacklist
+    ) {
         let clean = cleanDomain(domain)
         guard !clean.isEmpty else { return }
-        store.addDomainRules(profileID: profileID, appRuleID: appRuleID, groupID: groupID, domains: [clean])
+        store.addDomainRules(
+            profileID: profileID,
+            appRuleID: appRuleID,
+            groupID: groupID,
+            filterMode: filterMode,
+            domains: [clean]
+        )
         reloadAndApply(profileID: profileID)
         if shouldPromptForBrowserRestart(appRuleID: appRuleID) { noteBrowserPolicyChange() }
     }
 
-    func addDomainRulesBulk(profileID: Int64, domains: [String], appRuleID: Int64? = nil, groupID: Int64? = nil) {
-        store.addDomainRules(profileID: profileID, appRuleID: appRuleID, groupID: groupID, domains: domains)
+    func addDomainRulesBulk(
+        profileID: Int64,
+        domains: [String],
+        appRuleID: Int64? = nil,
+        groupID: Int64? = nil,
+        filterMode: FilterMode = .blacklist
+    ) {
+        store.addDomainRules(
+            profileID: profileID,
+            appRuleID: appRuleID,
+            groupID: groupID,
+            filterMode: filterMode,
+            domains: domains
+        )
         reloadAndApply(profileID: profileID)
         if shouldPromptForBrowserRestart(appRuleID: appRuleID) { noteBrowserPolicyChange() }
     }
@@ -577,10 +610,49 @@ final class FocusShieldViewModel {
     // MARK: - Private Helpers
 
     private func cleanDomain(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "https://", with: "")
-            .replacingOccurrences(of: "http://", with: "")
-            .components(separatedBy: "/").first ?? ""
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return "" }
+
+        let hasWildcardPrefix = value.hasPrefix("*.")
+        if hasWildcardPrefix {
+            value = String(value.dropFirst(2))
+        }
+
+        if value.contains("://"), let host = URL(string: value)?.host {
+            value = host
+        } else {
+            value = value
+                .replacingOccurrences(of: "https://", with: "")
+                .replacingOccurrences(of: "http://", with: "")
+                .components(separatedBy: "/").first ?? value
+        }
+
+        if value.contains(":") {
+            value = value.components(separatedBy: ":").first ?? value
+        }
+
+        value = value
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+
+        guard isValidDomainPattern(value) else { return "" }
+        return hasWildcardPrefix ? "*.\(value)" : value
+    }
+
+    private func isValidDomainPattern(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        if value == "localhost" || value == "local" { return true }
+
+        let labels = value.split(separator: ".")
+        guard labels.count >= 2 else { return false }
+
+        return labels.allSatisfy { label in
+            guard !label.isEmpty, label.first != "-", label.last != "-" else { return false }
+            return label.allSatisfy { character in
+                character.isLetter || character.isNumber || character == "-"
+            }
+        }
     }
 
     #if os(macOS)
@@ -661,22 +733,22 @@ final class FocusShieldViewModel {
 
         let hasBrowserDomains = profile.appRules.contains { appRule in
             AppNetworkSupport.isBrowser(bundleID: appRule.rule.bundleIdentifier)
-                && !appRule.domainRules.filter({ $0.isEnabled }).isEmpty
+                && !appRule.domainRules(for: appRule.effectiveFilterMode(globalMode: .blacklist)).filter({ $0.isEnabled }).isEmpty
         }
 
         let hasChromeRule = profile.appRules.contains {
             $0.rule.bundleIdentifier == "com.google.Chrome"
-                && !$0.domainRules.filter({ $0.isEnabled }).isEmpty
+                && !$0.domainRules(for: $0.effectiveFilterMode(globalMode: .blacklist)).filter({ $0.isEnabled }).isEmpty
         }
 
         let hasFirefoxRule = profile.appRules.contains {
             $0.rule.bundleIdentifier == "org.mozilla.firefox"
-                && !$0.domainRules.filter({ $0.isEnabled }).isEmpty
+                && !$0.domainRules(for: $0.effectiveFilterMode(globalMode: .blacklist)).filter({ $0.isEnabled }).isEmpty
         }
 
         let hasSafariDomains = profile.appRules.contains {
             $0.rule.bundleIdentifier == "com.apple.Safari"
-                && !$0.domainRules.filter({ $0.isEnabled }).isEmpty
+                && !$0.domainRules(for: $0.effectiveFilterMode(globalMode: .blacklist)).filter({ $0.isEnabled }).isEmpty
         }
 
         var health = EnforcementHealth()

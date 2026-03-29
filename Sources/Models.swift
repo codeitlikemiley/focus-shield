@@ -62,17 +62,19 @@ struct DomainRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePers
     var appRuleID: Int64?   // nil = global rule
     var groupID: Int64?     // nil = ungrouped
     var domain: String
+    var filterMode: FilterMode
     var isEnabled: Bool
 
     static let databaseTableName = "domain_rules"
 
     init(id: Int64? = nil, profileID: Int64, appRuleID: Int64? = nil, groupID: Int64? = nil,
-         domain: String, isEnabled: Bool = true) {
+         domain: String, filterMode: FilterMode = .blacklist, isEnabled: Bool = true) {
         self.id = id
         self.profileID = profileID
         self.appRuleID = appRuleID
         self.groupID = groupID
         self.domain = domain
+        self.filterMode = filterMode
         self.isEnabled = isEnabled
     }
 
@@ -253,6 +255,19 @@ struct AppRuleWithDomains: Identifiable {
     var needsBrowserRestart: Bool {
         AppNetworkSupport.isBrowser(bundleID: rule.bundleIdentifier)
     }
+
+    func domainRules(for mode: FilterMode) -> [DomainRule] {
+        let resolvedMode: FilterMode = mode == .whitelist ? .whitelist : .blacklist
+        return domainRules
+            .filter { $0.filterMode == resolvedMode }
+            .sorted { lhs, rhs in
+                lhs.domain.localizedStandardCompare(rhs.domain) == .orderedAscending
+            }
+    }
+
+    func domainCount(for mode: FilterMode) -> Int {
+        domainRules(for: mode).count
+    }
 }
 
 // MARK: - App Network Support Matrix
@@ -365,8 +380,8 @@ struct ProfileWithRules {
         let appOverrides: [ProfileNetworkPolicy.AppDomainOverride] = guiAppRules
             .filter { $0.rule.isEnabled && !$0.rule.isBlocked }
             .compactMap { appRule in
-                let domains = canonicalDomains(appRule.domainRules.filter { $0.isEnabled }.map { $0.domain })
                 let mode = appRule.effectiveFilterMode(globalMode: profile.globalMode)
+                let domains = canonicalDomains(appRule.domainRules(for: mode).filter { $0.isEnabled }.map { $0.domain })
                 guard !domains.isEmpty || mode == .whitelist else { return nil }
                 return ProfileNetworkPolicy.AppDomainOverride(
                     bundleID: appRule.rule.bundleIdentifier,
@@ -380,8 +395,8 @@ struct ProfileWithRules {
             .filter { $0.rule.isEnabled }
             .compactMap { cliRule in
                 guard let path = cliRule.rule.executablePath else { return nil }
-                let domains = canonicalDomains(cliRule.domainRules.filter { $0.isEnabled }.map { $0.domain })
                 let mode = cliRule.effectiveFilterMode(globalMode: profile.globalMode)
+                let domains = canonicalDomains(cliRule.domainRules(for: mode).filter { $0.isEnabled }.map { $0.domain })
                 return ProfileNetworkPolicy.CLINetworkRule(
                     executablePath: path,
                     isFullyBlocked: cliRule.rule.isBlocked,
