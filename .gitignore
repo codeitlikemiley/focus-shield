@@ -7,4 +7,9 @@ xcuserdata/
 *.dSYM
 *.ipa
 *.xcarchive
+*.xcresult
+*.dmg
+*.pkg
 .DS_Store
+.env
+.env.local
