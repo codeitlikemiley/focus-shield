@@ -297,10 +297,28 @@ final class FocusShieldViewModel {
         reloadSiteLists()
     }
 
-    func importSiteDomains(profileID: Int64, appRuleID: Int64, filterMode: FilterMode, domains: [String]) {
-        let clean = domains.map(cleanDomain).filter { !$0.isEmpty }
-        guard !clean.isEmpty else { return }
-        store.addDomainRules(profileID: profileID, appRuleID: appRuleID, filterMode: filterMode, domains: clean)
+    func importSiteDomains(
+        profileID: Int64,
+        appRuleID: Int64,
+        filterMode: FilterMode,
+        domains: [String],
+        siteListName: String? = nil
+    ) {
+        let prepared = prepareDomainAddition(
+            profileID: profileID,
+            rawDomains: domains,
+            appRuleID: appRuleID,
+            explicitGroupID: nil,
+            preferredGroupName: siteListName
+        )
+        guard !prepared.domains.isEmpty else { return }
+        store.addDomainRules(
+            profileID: profileID,
+            appRuleID: appRuleID,
+            groupID: prepared.groupID,
+            filterMode: filterMode,
+            domains: prepared.domains
+        )
         reloadAndApply(profileID: profileID)
         if shouldPromptForBrowserRestart(appRuleID: appRuleID) { noteBrowserPolicyChange() }
     }
@@ -314,14 +332,19 @@ final class FocusShieldViewModel {
         groupID: Int64? = nil,
         filterMode: FilterMode = .blacklist
     ) {
-        let clean = cleanDomain(domain)
-        guard !clean.isEmpty else { return }
+        let prepared = prepareDomainAddition(
+            profileID: profileID,
+            rawDomains: [domain],
+            appRuleID: appRuleID,
+            explicitGroupID: groupID
+        )
+        guard !prepared.domains.isEmpty else { return }
         store.addDomainRules(
             profileID: profileID,
             appRuleID: appRuleID,
-            groupID: groupID,
+            groupID: prepared.groupID,
             filterMode: filterMode,
-            domains: [clean]
+            domains: prepared.domains
         )
         reloadAndApply(profileID: profileID)
         if shouldPromptForBrowserRestart(appRuleID: appRuleID) { noteBrowserPolicyChange() }
@@ -334,12 +357,19 @@ final class FocusShieldViewModel {
         groupID: Int64? = nil,
         filterMode: FilterMode = .blacklist
     ) {
+        let prepared = prepareDomainAddition(
+            profileID: profileID,
+            rawDomains: domains,
+            appRuleID: appRuleID,
+            explicitGroupID: groupID
+        )
+        guard !prepared.domains.isEmpty else { return }
         store.addDomainRules(
             profileID: profileID,
             appRuleID: appRuleID,
-            groupID: groupID,
+            groupID: prepared.groupID,
             filterMode: filterMode,
-            domains: domains
+            domains: prepared.domains
         )
         reloadAndApply(profileID: profileID)
         if shouldPromptForBrowserRestart(appRuleID: appRuleID) { noteBrowserPolicyChange() }
@@ -684,6 +714,42 @@ final class FocusShieldViewModel {
         return hasWildcardPrefix ? "*.\(value)" : value
     }
 
+    private func prepareDomainAddition(
+        profileID: Int64,
+        rawDomains: [String],
+        appRuleID: Int64?,
+        explicitGroupID: Int64?,
+        preferredGroupName: String? = nil
+    ) -> PreparedDomainAddition {
+        let cleanedDomains = rawDomains.map(cleanDomain).filter { !$0.isEmpty }
+        guard !cleanedDomains.isEmpty else {
+            return PreparedDomainAddition(domains: [], groupID: explicitGroupID)
+        }
+
+        var seen = Set<String>()
+        let expandedDomains = cleanedDomains
+            .flatMap { SiteDomainBundle.expansion(for: $0).domains }
+            .filter { seen.insert($0).inserted }
+
+        guard appRuleID != nil, explicitGroupID == nil else {
+            return PreparedDomainAddition(domains: expandedDomains, groupID: explicitGroupID)
+        }
+
+        let cleanedGroupName = preferredGroupName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackGroupName = cleanedDomains.count == 1
+            ? SiteDomainBundle.expansion(for: cleanedDomains[0]).groupLabel
+            : nil
+        let desiredGroupName = (cleanedGroupName?.isEmpty == false ? cleanedGroupName : nil) ?? fallbackGroupName
+
+        guard let desiredGroupName else {
+            return PreparedDomainAddition(domains: expandedDomains, groupID: nil)
+        }
+
+        let groupID = store.ensureCustomGroup(profileID: profileID, name: desiredGroupName)
+        return PreparedDomainAddition(domains: expandedDomains, groupID: groupID == 0 ? nil : groupID)
+    }
+
     private func isValidDomainPattern(_ value: String) -> Bool {
         guard !value.isEmpty else { return false }
         if value == "localhost" || value == "local" { return true }
@@ -827,6 +893,11 @@ final class FocusShieldViewModel {
         }
     }
     #endif
+}
+
+private struct PreparedDomainAddition {
+    let domains: [String]
+    let groupID: Int64?
 }
 
 // MARK: - Enforcement Health

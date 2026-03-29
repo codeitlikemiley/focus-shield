@@ -469,6 +469,28 @@ final class DataStore: @unchecked Sendable {
         }) ?? 0
     }
 
+    func findCustomGroup(profileID: Int64, name: String) -> CustomDomainGroup? {
+        try? dbQueue.read { db in
+            try CustomDomainGroup
+                .filter(Column("profileID") == profileID)
+                .filter(sql: "LOWER(name) = LOWER(?)", arguments: [name])
+                .fetchOne(db)
+        }
+    }
+
+    @discardableResult
+    func ensureCustomGroup(profileID: Int64, name: String) -> Int64 {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else { return 0 }
+        if let existing = findCustomGroup(profileID: profileID, name: cleanName),
+           let id = existing.id {
+            return id
+        }
+
+        var group = CustomDomainGroup(profileID: profileID, name: cleanName)
+        return saveCustomGroup(&group)
+    }
+
     func deleteCustomGroup(id: Int64) {
         _ = try? dbQueue.write { db in try CustomDomainGroup.deleteOne(db, key: id) }
     }

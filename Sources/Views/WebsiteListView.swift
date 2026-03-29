@@ -314,7 +314,7 @@ struct ImportSiteListSheet: View {
             Text("Import Into \(title)")
                 .font(.title2.weight(.bold))
 
-            Text("Imported domains are added to the \(filterMode.label.lowercased()) list for this rule only.")
+            Text("Imported domains are added to the \(filterMode.label.lowercased()) list for this rule only, expanded with known related site-family domains, and grouped under the template name.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
 
@@ -381,7 +381,8 @@ struct ImportSiteListSheet: View {
                         profileID: profileID,
                         appRuleID: appRuleID,
                         filterMode: filterMode,
-                        domains: selectedDomains
+                        domains: selectedDomains,
+                        siteListName: selectedList.list.name
                     )
                     dismiss()
                 }

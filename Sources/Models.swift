@@ -223,6 +223,7 @@ struct DomainGroup: Identifiable {
         var result: [DomainGroup] = []
         for group in groups {
             let groupRules = groupMap[group.id!] ?? []
+            guard !groupRules.isEmpty else { continue }
             result.append(DomainGroup(id: String(group.id!), label: group.name,
                                       rules: groupRules.sorted { $0.domain < $1.domain }))
         }
@@ -310,6 +311,78 @@ enum AppNetworkSupport {
     }
 }
 
+enum SiteDomainBundle {
+    struct Expansion {
+        let groupLabel: String?
+        let domains: [String]
+    }
+
+    private static let knownFamilies: [String: [String]] = [
+        "facebook.com": [
+            "facebook.com", "*.facebook.com",
+            "*.fbcdn.net", "*.fbsbx.com",
+            "messenger.com", "*.messenger.com", "m.me"
+        ],
+        "instagram.com": [
+            "instagram.com", "*.instagram.com",
+            "*.cdninstagram.com", "*.fbcdn.net", "*.fbsbx.com"
+        ],
+        "youtube.com": [
+            "youtube.com", "*.youtube.com", "youtu.be",
+            "*.googlevideo.com", "*.ytimg.com",
+            "*.youtubei.googleapis.com", "*.gstatic.com"
+        ],
+        "twitter.com": [
+            "twitter.com", "*.twitter.com",
+            "x.com", "*.x.com",
+            "t.co", "*.t.co", "*.twimg.com"
+        ],
+        "x.com": [
+            "x.com", "*.x.com",
+            "twitter.com", "*.twitter.com",
+            "t.co", "*.t.co", "*.twimg.com"
+        ],
+    ]
+
+    static func expansion(for rawDomain: String) -> Expansion {
+        let normalized = rawDomain
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else {
+            return Expansion(groupLabel: nil, domains: [])
+        }
+
+        let isWildcard = normalized.hasPrefix("*.")
+        let base = isWildcard ? String(normalized.dropFirst(2)) : normalized
+        let labelCount = base.split(separator: ".").count
+        let shouldExpand = isWildcard || labelCount <= 2 || knownFamilies[base] != nil
+
+        guard shouldExpand else {
+            return Expansion(groupLabel: nil, domains: [normalized])
+        }
+
+        var seen = Set<String>()
+        var expanded: [String] = []
+
+        func append(_ domain: String) {
+            let clean = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !clean.isEmpty, seen.insert(clean).inserted else { return }
+            expanded.append(clean)
+        }
+
+        append(base)
+        append("*.\(base)")
+        for domain in knownFamilies[base] ?? [] {
+            append(domain)
+        }
+
+        expanded.sort { lhs, rhs in
+            lhs.localizedStandardCompare(rhs) == .orderedAscending
+        }
+        return Expansion(groupLabel: base, domains: expanded)
+    }
+}
+
 // MARK: - Profile Network Policy (computed, passed to HostsFileService)
 
 struct ProfileNetworkPolicy {
@@ -368,6 +441,7 @@ struct ProfileWithRules {
     private func canonicalDomains(_ domains: [String]) -> [String] {
         var seen = Set<String>()
         return domains
+            .flatMap { SiteDomainBundle.expansion(for: $0).domains }
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty }
             .filter { seen.insert($0).inserted }

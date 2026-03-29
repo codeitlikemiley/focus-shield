@@ -2,7 +2,7 @@ import SwiftUI
 
 struct RuleDomainEditorView: View {
     let currentMode: FilterMode
-    let displayedRules: [DomainRule]
+    let displayedGroups: [DomainGroup]
     let whitelistCount: Int
     let blacklistCount: Int
     let addPlaceholder: String
@@ -55,7 +55,7 @@ struct RuleDomainEditorView: View {
             }
             .padding(.leading, 16)
 
-            if displayedRules.isEmpty {
+            if displayedGroups.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: currentMode == .whitelist ? "checkmark.shield" : "hand.raised")
                         .foregroundStyle(.secondary)
@@ -67,34 +67,50 @@ struct RuleDomainEditorView: View {
                 }
                 .padding(.leading, 32)
             } else {
-                ForEach(displayedRules, id: \.id) { domainRule in
-                    HStack {
-                        Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 16)
-                        Text(domainRule.domain)
-                            .font(.system(size: 12))
-                        Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { domainRule.isEnabled },
-                            set: { isEnabled in
-                                guard let id = domainRule.id else { return }
-                                onToggleRule(id, isEnabled)
-                            }
-                        ))
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                        Button(role: .destructive) {
-                            guard let id = domainRule.id else { return }
-                            onDeleteRule(id)
-                        } label: {
-                            Image(systemName: "trash")
-                                .foregroundStyle(.red.opacity(0.7))
+                let showGroupLabels = displayedGroups.count > 1 || displayedGroups.first?.id != "ungrouped"
+                ForEach(displayedGroups) { group in
+                    if showGroupLabels {
+                        HStack {
+                            Text(group.label)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(group.enabledCount)/\(group.rules.count)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
                         }
-                        .buttonStyle(.plain)
+                        .padding(.leading, 32)
                     }
-                    .padding(.leading, 32)
+
+                    ForEach(group.rules, id: \.id) { domainRule in
+                        HStack {
+                            Image(systemName: domainRule.domain.hasPrefix("*.") ? "asterisk" : "globe")
+                                .foregroundStyle(.secondary)
+                                .frame(width: 16)
+                            Text(domainRule.domain)
+                                .font(.system(size: 12))
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { domainRule.isEnabled },
+                                set: { isEnabled in
+                                    guard let id = domainRule.id else { return }
+                                    onToggleRule(id, isEnabled)
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .labelsHidden()
+                            Button(role: .destructive) {
+                                guard let id = domainRule.id else { return }
+                                onDeleteRule(id)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .foregroundStyle(.red.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.leading, 32)
+                    }
                 }
             }
 

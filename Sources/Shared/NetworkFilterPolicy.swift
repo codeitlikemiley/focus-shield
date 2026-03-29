@@ -114,12 +114,21 @@ extension NetworkFilterPolicy {
 
         func decision(forHost rawHost: String?) -> Decision {
             guard let rawHost else {
-                return mode == .whitelist ? .block : .allow
+                return .allow
             }
 
             let host = NetworkFilterPolicy.normalizeHost(rawHost)
             guard !host.isEmpty else {
-                return mode == .whitelist ? .block : .allow
+                return .allow
+            }
+
+            // Socket-level flows often arrive after DNS resolution with only an IP literal
+            // and no recoverable hostname. In whitelist mode, treating those as a hard miss
+            // blocks even allowed destinations like facebook.com after the initial request.
+            // We only deny when we have a concrete hostname that is definitely outside the
+            // configured allow-list.
+            if Self.isIPAddress(host) {
+                return .allow
             }
 
             let matched = domains.contains { Self.matches(host: host, rule: $0) }
@@ -140,6 +149,11 @@ extension NetworkFilterPolicy {
                 .sorted()
         }
 
+        private static func isIPAddress(_ host: String) -> Bool {
+            if host.contains(":") { return true }
+            return host.allSatisfy { $0.isNumber || $0 == "." }
+        }
+
         private static func matches(host: String, rule rawRule: String) -> Bool {
             let rule = NetworkFilterPolicy.normalizeHost(rawRule)
             guard !rule.isEmpty else { return false }
@@ -148,7 +162,7 @@ extension NetworkFilterPolicy {
                 return host == wildcardBase || host.hasSuffix(".\(wildcardBase)")
             }
 
-            return host == rule
+            return host == rule || host.hasSuffix(".\(rule)")
         }
     }
 }

@@ -5,18 +5,25 @@ APP_PATH := /Applications/$(APP_NAME).app
 SWIFT_ENV := env HOME=/tmp CLANG_MODULE_CACHE_PATH=/tmp/clang-module-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/clang-module-cache
 SIMULATOR ?= iPhone 16
 TEAM_ID ?=
+VERSION_ARGS :=
 
 ifneq (,$(wildcard .env))
 include .env
 export
 endif
 
+ifneq ($(filter version,$(MAKECMDGOALS)),)
+VERSION_ARGS := $(filter-out version,$(MAKECMDGOALS))
+$(foreach arg,$(VERSION_ARGS),$(eval .PHONY: $(arg)))
+$(foreach arg,$(VERSION_ARGS),$(eval $(arg): ; @:))
+endif
+
 .DEFAULT_GOAL := help
 
 .PHONY: help advanced build release install run open clean verify \
 	run-local rebuild scripts generate-xcode open-xcode \
-	build-ios run-ios list-sims build-macos-signed install-macos-signed run-macos-signed archive-macos archive-ios \
-	uninstall aliases diagnose
+	build-ios run-ios list-sims build-macos-signed install-macos-signed run-macos-signed package-macos-signed archive-macos archive-ios \
+	uninstall aliases diagnose version
 
 help:
 	@echo "FocusShield Common Commands"
@@ -50,8 +57,13 @@ advanced:
 	@echo "  make build-macos-signed Build signed macOS app (uses .env TEAM_ID)"
 	@echo "  make install-macos-signed Install signed macOS app (uses .env TEAM_ID)"
 	@echo "  make run-macos-signed  Install and open signed macOS app (uses .env TEAM_ID)"
+	@echo "  make package-macos-signed Build signed macOS release assets (.app.zip + .dmg)"
 	@echo "  make archive-macos      Archive macOS app (uses .env TEAM_ID)"
 	@echo "  make archive-ios        Archive iOS app (uses .env TEAM_ID)"
+	@echo "  make version            Tag current MARKETING_VERSION and push"
+	@echo "  make version force      Re-create and force-push the current version tag"
+	@echo "  make version 1.2.3      Tag a specific version and push"
+	@echo "                          Note: make cannot parse '--force'; use 'force' instead"
 
 build:
 	$(SWIFT_ENV) swift build
@@ -116,6 +128,10 @@ install-macos-signed:
 run-macos-signed:
 	@if [ -z "$(TEAM_ID)" ]; then echo "TEAM_ID is required"; exit 1; fi
 	./build.sh run-macos-signed "$(TEAM_ID)"
+
+package-macos-signed:
+	@if [ -z "$(TEAM_ID)" ]; then echo "TEAM_ID is required"; exit 1; fi
+	./scripts/package-macos-release.sh "$(TEAM_ID)"
 
 archive-macos:
 	@if [ -z "$(TEAM_ID)" ]; then echo "TEAM_ID is required"; exit 1; fi
@@ -211,3 +227,6 @@ diagnose:
 	 fi
 	@echo ""
 	@echo "═══════════════════════════════════════════════"
+
+version:
+	./scripts/version.sh $(VERSION_ARGS)

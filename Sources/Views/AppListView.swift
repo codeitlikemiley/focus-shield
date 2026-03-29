@@ -167,12 +167,16 @@ struct AppRulesTab: View {
         let ruleID: Int64? = appRule.rule.id
         let isExpanded: Bool = expandedRuleID != nil && expandedRuleID == ruleID
         let activeMode = appRule.effectiveFilterMode(globalMode: .blacklist)
+        let activeGroups = DomainGroup.build(
+            rules: appRule.domainRules(for: activeMode),
+            groups: profileWithRules?.customDomainGroups ?? []
+        )
         Section {
             if isExpanded {
                 if appRule.supportsPerAppDomainFiltering {
                     RuleDomainEditorView(
                         currentMode: activeMode,
-                        displayedRules: appRule.domainRules(for: activeMode),
+                        displayedGroups: activeGroups,
                         whitelistCount: appRule.domainCount(for: .whitelist),
                         blacklistCount: appRule.domainCount(for: .blacklist),
                         addPlaceholder: "Add facebook.com, m.facebook.com, or *.facebook.com",

@@ -106,6 +106,10 @@ struct CLIRulesTab: View {
         let ruleID: Int64? = cliRule.rule.id
         let isExpanded: Bool = expandedRuleID != nil && expandedRuleID == ruleID
         let activeMode = cliRule.effectiveFilterMode(globalMode: .blacklist)
+        let activeGroups = DomainGroup.build(
+            rules: cliRule.domainRules(for: activeMode),
+            groups: profileWithRules?.customDomainGroups ?? []
+        )
         Section {
             if isExpanded {
                 // Executable path info
@@ -119,7 +123,7 @@ struct CLIRulesTab: View {
 
                 RuleDomainEditorView(
                     currentMode: activeMode,
-                    displayedRules: cliRule.domainRules(for: activeMode),
+                    displayedGroups: activeGroups,
                     whitelistCount: cliRule.domainCount(for: .whitelist),
                     blacklistCount: cliRule.domainCount(for: .blacklist),
                     addPlaceholder: "Add api.example.com or *.example.com",
