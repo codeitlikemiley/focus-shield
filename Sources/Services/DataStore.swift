@@ -193,7 +193,53 @@ final class DataStore: @unchecked Sendable {
                 }
             }
         }
+        migrator.registerMigration("v13_add_char_policies") { db in
+            try db.create(table: "profile_char_policies", ifNotExists: true) { t in
+                t.primaryKey("profileID", .integer).references("profiles", onDelete: .cascade)
+                t.column("zeroWidthBlock",       .boolean).notNull().defaults(to: false)
+                t.column("rtlOverrideBlock",     .boolean).notNull().defaults(to: false)
+                t.column("tagCharBlock",         .boolean).notNull().defaults(to: false)
+                t.column("invisibleFormatBlock", .boolean).notNull().defaults(to: false)
+                t.column("homoglyphAlert",       .boolean).notNull().defaults(to: false)
+                t.column("isEnabled",            .boolean).notNull().defaults(to: false)
+            }
+        }
+
+        migrator.registerMigration("v14_add_self_sandbox_flag") { db in
+            // hasSelfSandbox: when true the CLI proxy wrapper is skipped — the tool
+            // manages its own sandbox (e.g. Claude Code). NEFilter still enforces
+            // domain rules at the socket level.
+            try db.alter(table: "app_rules") { t in
+                t.add(column: "hasSelfSandbox", .boolean).notNull().defaults(to: false)
+            }
+        }
+
+        migrator.registerMigration("v15_add_filesystem_modes") { db in
+            let cols = try db.columns(in: "app_rules").map { $0.name }
+            if !cols.contains("filesystemReadMode") {
+                try db.alter(table: "app_rules") { t in
+                    t.add(column: "filesystemReadMode", .text).notNull().defaults(to: "disabled")
+                }
+            }
+            if !cols.contains("filesystemWriteMode") {
+                try db.alter(table: "app_rules") { t in
+                    t.add(column: "filesystemWriteMode", .text).notNull().defaults(to: "disabled")
+                }
+            }
+        }
+
+        migrator.registerMigration("v16_add_filesystem_path_rules") { db in
+            try db.create(table: "filesystem_path_rules", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("appRuleID", .integer).notNull().references("app_rules", onDelete: .cascade)
+                t.column("accessType", .text).notNull()
+                t.column("path", .text).notNull()
+                t.column("isEnabled", .boolean).notNull().defaults(to: true)
+            }
+        }
+
         try migrator.migrate(q)
+
         return q
     }
 
@@ -266,6 +312,7 @@ final class DataStore: @unchecked Sendable {
 
     func resetAllData() {
         try? dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM profile_char_policies")
             try db.execute(sql: "DELETE FROM domain_rules")
             try db.execute(sql: "DELETE FROM app_rules")
             try db.execute(sql: "DELETE FROM custom_groups")
@@ -472,6 +519,18 @@ final class DataStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Char Policies
+
+    func fetchCharPolicy(profileID: Int64) -> ProfileCharPolicy {
+        (try? dbQueue.read { db in
+            try ProfileCharPolicy.fetchOne(db, key: profileID)
+        }) ?? .defaultPolicy(profileID: profileID)
+    }
+
+    func saveCharPolicy(_ policy: ProfileCharPolicy) {
+        _ = try? dbQueue.write { db in try policy.save(db) }
+    }
+
     // MARK: - Profiles
 
     func fetchAllProfiles() -> [BlockProfile] {
@@ -654,6 +713,19 @@ final class DataStore: @unchecked Sendable {
         try? dbQueue.read { db in try AppRule.fetchOne(db, key: id) }
     }
 
+    func fetchFilesystemPathRules(appRuleID: Int64) -> [FilesystemPathRule] {
+        (try? dbQueue.read { db in
+            try FilesystemPathRule
+                .filter(Column("appRuleID") == appRuleID)
+                .order(Column("accessType"), Column("path"))
+                .fetchAll(db)
+        }) ?? []
+    }
+
+    func fetchFilesystemPathRule(id: Int64) -> FilesystemPathRule? {
+        try? dbQueue.read { db in try FilesystemPathRule.fetchOne(db, key: id) }
+    }
+
     @discardableResult
     func saveAppRule(_ rule: inout AppRule) -> Int64 {
         (try? dbQueue.write { db in
@@ -680,6 +752,13 @@ final class DataStore: @unchecked Sendable {
         }
     }
 
+    func toggleSelfSandbox(id: Int64, hasSelfSandbox: Bool) {
+        _ = try? dbQueue.write { db in
+            try db.execute(sql: "UPDATE app_rules SET hasSelfSandbox = ? WHERE id = ?",
+                           arguments: [hasSelfSandbox, id])
+        }
+    }
+
     func updateAppFilterMode(id: Int64, filterMode: FilterMode) {
         _ = try? dbQueue.write { db in
             try db.execute(sql: "UPDATE app_rules SET filterMode = ? WHERE id = ?",
@@ -696,6 +775,46 @@ final class DataStore: @unchecked Sendable {
         }
     }
 
+    func updateFilesystemMode(id: Int64, accessType: FilesystemAccessType, mode: FilesystemMode) {
+        let columnName = accessType == .read ? "filesystemReadMode" : "filesystemWriteMode"
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE app_rules SET \(columnName) = ? WHERE id = ?",
+                arguments: [mode.rawValue, id]
+            )
+        }
+    }
+
+    @discardableResult
+    func saveFilesystemPathRule(_ rule: inout FilesystemPathRule) -> Int64 {
+        (try? dbQueue.write { db in
+            try rule.save(db)
+            return rule.id!
+        }) ?? 0
+    }
+
+    func deleteFilesystemPathRule(id: Int64) {
+        _ = try? dbQueue.write { db in try FilesystemPathRule.deleteOne(db, key: id) }
+    }
+
+    func toggleFilesystemPathRule(id: Int64, enabled: Bool) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE filesystem_path_rules SET isEnabled = ? WHERE id = ?",
+                arguments: [enabled, id]
+            )
+        }
+    }
+
+    func updateFilesystemPathRuleValue(id: Int64, path: String) {
+        _ = try? dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE filesystem_path_rules SET path = ? WHERE id = ?",
+                arguments: [path, id]
+            )
+        }
+    }
+
     // MARK: - Full Profile with Relations
 
     func fetchProfileWithRules(id: Int64) -> ProfileWithRules? {
@@ -706,7 +825,8 @@ final class DataStore: @unchecked Sendable {
         let appRulesWithDomains = appRules.map { rule in
             AppRuleWithDomains(
                 rule: rule,
-                domainRules: rule.id.map { fetchDomainRules(appRuleID: $0) } ?? []
+                domainRules: rule.id.map { fetchDomainRules(appRuleID: $0) } ?? [],
+                filesystemPathRules: rule.id.map { fetchFilesystemPathRules(appRuleID: $0) } ?? []
             )
         }
         return ProfileWithRules(profile: profile, customDomainGroups: customGroups, globalDomainRules: globalRules,

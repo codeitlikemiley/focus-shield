@@ -29,6 +29,8 @@ final class FocusShieldViewModel {
     var activeProfile: ProfileWithRules?
     var siteLists: [SiteListWithDomains]
     var payloadPatterns: [PayloadPattern]
+    /// Cache of per-profile char policies (loaded on demand, keyed by profileID).
+    var charPolicies: [Int64: ProfileCharPolicy] = [:]
     var dataVersion: Int = 0
 
     // Transient UI state
@@ -59,6 +61,10 @@ final class FocusShieldViewModel {
         self.siteLists = DataStore.shared.fetchSiteListsWithDomains()
         self.payloadPatterns = DataStore.shared.fetchPayloadPatterns()
         self.activeProfile = settings.activeProfileID.flatMap { DataStore.shared.fetchProfileWithRules(id: $0) }
+        // Pre-load char policy for active profile if one exists
+        if let pid = settings.activeProfileID {
+            charPolicies[pid] = DataStore.shared.fetchCharPolicy(profileID: pid)
+        }
 
         #if os(macOS)
         KeyboardShortcuts.onKeyUp(for: .toggleFocusShield) { [weak self] in
@@ -489,13 +495,79 @@ final class FocusShieldViewModel {
         reloadAndApply(profileID: profileID)
     }
 
+    /// Convenience: add a pre-configured AI agent rule (hasSelfSandbox = true).
+    func addAgentRule(profileID: Int64, agent: KnownSandboxedAgent,
+                      filterMode: FilterMode = .whitelist) {
+        var rule = agent.makeRule(profileID: profileID, filterMode: filterMode)
+        store.saveAppRule(&rule)
+        reloadAndApply(profileID: profileID)
+    }
+
     func toggleCLIBlocked(profileID: Int64, id: Int64, blocked: Bool) {
         store.toggleAppBlocked(id: id, blocked: blocked)
         reloadAndApply(profileID: profileID)
     }
 
+    func toggleSelfSandbox(profileID: Int64, id: Int64, hasSelfSandbox: Bool) {
+        store.toggleSelfSandbox(id: id, hasSelfSandbox: hasSelfSandbox)
+        reloadAndApply(profileID: profileID)
+    }
+
     func setCLIFilterMode(profileID: Int64, id: Int64, filterMode: FilterMode) {
         store.updateAppFilterMode(id: id, filterMode: filterMode)
+        reloadAndApply(profileID: profileID)
+    }
+
+    func setFilesystemMode(
+        profileID: Int64,
+        id: Int64,
+        accessType: FilesystemAccessType,
+        mode: FilesystemMode
+    ) {
+        store.updateFilesystemMode(id: id, accessType: accessType, mode: mode)
+        reloadAndApply(profileID: profileID)
+    }
+
+    func addFilesystemPathRule(
+        profileID: Int64,
+        appRuleID: Int64,
+        accessType: FilesystemAccessType,
+        path: String
+    ) {
+        let cleaned = cleanFilesystemPath(path)
+        guard !cleaned.isEmpty else { return }
+
+        if let existing = store.fetchProfileWithRules(id: profileID)?
+            .appRules
+            .first(where: { $0.rule.id == appRuleID })?
+            .filesystemPathRules(for: accessType)
+            .first(where: { $0.path.caseInsensitiveCompare(cleaned) == .orderedSame }) {
+            if let existingID = existing.id, !existing.isEnabled {
+                store.toggleFilesystemPathRule(id: existingID, enabled: true)
+                reloadAndApply(profileID: profileID)
+            }
+            return
+        }
+
+        var rule = FilesystemPathRule(appRuleID: appRuleID, accessType: accessType, path: cleaned)
+        store.saveFilesystemPathRule(&rule)
+        reloadAndApply(profileID: profileID)
+    }
+
+    func updateFilesystemPathRule(profileID: Int64, id: Int64, path: String) {
+        let cleaned = cleanFilesystemPath(path)
+        guard !cleaned.isEmpty else { return }
+        store.updateFilesystemPathRuleValue(id: id, path: cleaned)
+        reloadAndApply(profileID: profileID)
+    }
+
+    func toggleFilesystemPathRule(profileID: Int64, id: Int64, enabled: Bool) {
+        store.toggleFilesystemPathRule(id: id, enabled: enabled)
+        reloadAndApply(profileID: profileID)
+    }
+
+    func removeFilesystemPathRule(profileID: Int64, id: Int64) {
+        store.deleteFilesystemPathRule(id: id)
         reloadAndApply(profileID: profileID)
     }
 
@@ -602,7 +674,9 @@ final class FocusShieldViewModel {
         isProcessing = true
         errorMessage = nil
 
-        let policy = profile.computeNetworkPolicy()
+        let activeCharScanEnv = settings.activeProfileID.flatMap { charPolicies[$0] }?.cliEnv
+            ?? ["FOCUSSHIELD_CHARSCAN_ENABLED": "0"]
+        let policy = profile.computeNetworkPolicy(charScanEnv: activeCharScanEnv)
 
         #if os(macOS)
         Task {
@@ -754,6 +828,10 @@ final class FocusShieldViewModel {
         return hasWildcardPrefix ? "*.\(value)" : value
     }
 
+    private func cleanFilesystemPath(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func prepareDomainAddition(
         profileID: Int64,
         rawDomains: [String],
@@ -845,10 +923,31 @@ final class FocusShieldViewModel {
     }
 
     private func syncPayloadProtectionConfiguration() {
+        let activeCharPolicy: ProfileCharPolicy? = settings.activeProfileID.flatMap { charPolicies[$0] }
         PayloadProtectionService.syncRuntimeConfiguration(
             enabled: settings.payloadProtectionEnabled,
-            patterns: payloadPatterns
+            patterns: payloadPatterns,
+            charScanEnv: activeCharPolicy?.cliEnv ?? ["FOCUSSHIELD_CHARSCAN_ENABLED": "0"]
         )
+    }
+
+    // MARK: - Char Policy Management
+
+    /// Returns the char policy for the given profile, loading from DB if not yet cached.
+    func charPolicy(for profileID: Int64) -> ProfileCharPolicy {
+        if let cached = charPolicies[profileID] { return cached }
+        let loaded = store.fetchCharPolicy(profileID: profileID)
+        charPolicies[profileID] = loaded
+        return loaded
+    }
+
+    func saveCharPolicy(_ policy: ProfileCharPolicy) {
+        store.saveCharPolicy(policy)
+        charPolicies[policy.profileID] = policy
+        // Re-sync CLI env vars if this is the active profile
+        if settings.activeProfileID == policy.profileID {
+            syncPayloadProtectionConfiguration()
+        }
     }
 
     private func reloadAndApply(profileID: Int64) {

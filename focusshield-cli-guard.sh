@@ -4,6 +4,14 @@ set -eu
 REAL_EXEC="$1"
 shift
 
+# ── Guard against recursive invocation ──
+# The guard uses system utilities (cat, head, grep, perl, mktemp, awk, shasum).
+# If any of those are also FocusShield-wrapped, calling them would spawn a new
+# guard instance, causing a fork bomb. Strip wrapper dirs from PATH for the
+# duration of this script; restore before the final exec.
+_FS_SAVED_PATH="$PATH"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
 TOOL_NAME="${FOCUSSHIELD_TOOL_NAME:-$(basename "$REAL_EXEC")}"
 FILTER_MODE="${FOCUSSHIELD_FILTER_MODE:-blacklist}"
 DOMAIN_RULES_B64="${FOCUSSHIELD_DOMAIN_RULES_B64:-}"
@@ -11,6 +19,7 @@ PAYLOAD_PROTECTION="${FOCUSSHIELD_PAYLOAD_PROTECTION:-0}"
 PATTERNS_FILE="${FOCUSSHIELD_PAYLOAD_PATTERNS_FILE:-}"
 ALLOWLIST_FILE="${FOCUSSHIELD_PAYLOAD_ALLOWLIST_FILE:-}"
 SESSION_ALLOWLIST_FILE="${FOCUSSHIELD_PAYLOAD_SESSION_ALLOWLIST_FILE:-}"
+SEATBELT_PROFILE="${FOCUSSHIELD_SEATBELT_PROFILE:-}"
 
 # ── On-demand domain-add via env vars ──
 # Usage: l=w curl facebook.com   (or list=whitelist, l=b, list=black, etc.)
@@ -80,14 +89,14 @@ trap cleanup EXIT INT TERM HUP
 
 printf 'tool=%s\n' "$TOOL_NAME" > "$SCAN_FILE"
 printf 'argv=' >> "$SCAN_FILE"
-printf '%q ' "$@" >> "$SCAN_FILE"
+printf '%s ' "$@" >> "$SCAN_FILE"
 printf '\n' >> "$SCAN_FILE"
 
 if [ ! -t 0 ]; then
     STDIN_FILE=$(mktemp -t focusshield_stdin.XXXXXX)
     cat > "$STDIN_FILE"
     printf '\nstdin:\n' >> "$SCAN_FILE"
-    head -c 262144 "$STDIN_FILE" >> "$SCAN_FILE" 2>/dev/null || true
+    head -c 4194304 "$STDIN_FILE" >> "$SCAN_FILE" 2>/dev/null || true
     printf '\n' >> "$SCAN_FILE"
 fi
 
@@ -242,11 +251,95 @@ check_payload_patterns() {
     return 0
 }
 
+check_invisible_chars() {
+    CHARSCAN_ENABLED="${FOCUSSHIELD_CHARSCAN_ENABLED:-0}"
+    [ "$CHARSCAN_ENABLED" = "1" ] || return 0
+
+    CHARSCAN_ZWSP="${FOCUSSHIELD_CHARSCAN_ZWSP:-0}"
+    CHARSCAN_RTL="${FOCUSSHIELD_CHARSCAN_RTL:-0}"
+    CHARSCAN_TAGS="${FOCUSSHIELD_CHARSCAN_TAGS:-0}"
+    CHARSCAN_INVIS="${FOCUSSHIELD_CHARSCAN_INVIS:-0}"
+    CHARSCAN_HOMOGLYPH="${FOCUSSHIELD_CHARSCAN_HOMOGLYPH:-0}"
+
+    local checks=""
+    [ "$CHARSCAN_ZWSP"      = "1" ] && checks="${checks}zwsp,"
+    [ "$CHARSCAN_RTL"       = "1" ] && checks="${checks}rtl,"
+    [ "$CHARSCAN_TAGS"      = "1" ] && checks="${checks}tags,"
+    [ "$CHARSCAN_INVIS"     = "1" ] && checks="${checks}invis,"
+    [ "$CHARSCAN_HOMOGLYPH" = "1" ] && checks="${checks}homoglyph,"
+    [ -n "$checks" ] || return 0
+
+    local hit_names
+    hit_names=$(/usr/bin/perl -e '
+use strict; use warnings;
+binmode(STDIN, ":utf8");
+my @checks = split(/,/, $ARGV[0] // "");
+local $/; my $data = <STDIN> // "";
+my %found;
+for my $c (@checks) {
+    if    ($c eq "zwsp")      { $found{$c}++ if $data =~ /[\x{200B}\x{200C}\x{200D}\x{FEFF}\x{2060}\x{FFFC}\x{FFF9}\x{FFFA}\x{FFFB}]/ }
+    elsif ($c eq "rtl")       { $found{$c}++ if $data =~ /[\x{202A}-\x{202E}\x{2066}-\x{2069}]/ }
+    elsif ($c eq "tags")      { $found{$c}++ if $data =~ /[\x{E0001}-\x{E007F}]/ }
+    elsif ($c eq "invis")     { $found{$c}++ if $data =~ /[\x{00AD}\x{115F}\x{1160}\x{3164}\x{17B4}\x{17B5}\x{180B}-\x{180D}\x{FE00}-\x{FE0F}]/ }
+    elsif ($c eq "homoglyph") { $found{$c}++ if $data =~ /[\x{0430}-\x{0435}\x{043E}\x{0440}\x{0441}\x{0445}\x{03BF}\x{03B1}]/ }
+}
+print join("\n", keys %found), "\n" if %found;
+' "$checks" < "$SCAN_FILE" 2>/dev/null || true)
+
+    [ -n "$hit_names" ] || return 0
+
+    local fingerprint
+    fingerprint=$(printf '%s%s' "$hit_names" "$(wc -c < "$SCAN_FILE")" \
+        | /usr/bin/shasum -a 256 | awk '{print $1}')
+    [ -n "$ALLOWLIST_FILE" ]         || ALLOWLIST_FILE="/tmp/focusshield-payload-allowlist.txt"
+    [ -n "$SESSION_ALLOWLIST_FILE" ] || SESSION_ALLOWLIST_FILE="/tmp/focusshield-payload-session-allowlist.txt"
+    touch "$ALLOWLIST_FILE" "$SESSION_ALLOWLIST_FILE"
+
+    if contains_allow_fingerprint "$fingerprint" "$ALLOWLIST_FILE" \
+        || contains_allow_fingerprint "$fingerprint" "$SESSION_ALLOWLIST_FILE"; then
+        return 0
+    fi
+
+    local labels
+    labels=$(printf '%s\n' "$hit_names" | sed \
+        -e 's/zwsp/Zero-Width Characters/g' \
+        -e 's/rtl/RTL Override\/Embedding/g' \
+        -e 's/tags/Invisible Tag Characters (prompt-injection risk)/g' \
+        -e 's/invis/Invisible Format Characters/g' \
+        -e 's/homoglyph/Unicode Homoglyphs (lookalike letters)/g')
+    local message button
+    message=$(printf "FocusShield detected suspicious Unicode in the %s payload:\n\n%s\n\nAllow this request?" \
+        "$TOOL_NAME" "$labels")
+    button=$(/usr/bin/osascript \
+        -e "button returned of (display dialog \"$(escape_applescript "$message")\" \
+            buttons {\"Deny\", \"Allow Session\", \"Always Allow\"} \
+            default button \"Deny\" with icon caution)" 2>/dev/null || true)
+
+    case "$button" in
+        "Allow Session") record_allow_fingerprint "$fingerprint" "$SESSION_ALLOWLIST_FILE" ;;
+        "Always Allow")  record_allow_fingerprint "$fingerprint" "$ALLOWLIST_FILE" ;;
+        *)
+            echo "focusshield: request denied — invisible/bad Unicode characters detected in payload." >&2
+            return 1 ;;
+    esac
+}
+
 check_domain_policy
 check_payload_patterns
+check_invisible_chars
+
+# Restore full PATH so the real tool runs in the user's environment
+export PATH="$_FS_SAVED_PATH"
+
+seatbelt_exec() {
+    if [ -n "$SEATBELT_PROFILE" ] && [ -f "$SEATBELT_PROFILE" ] && [ -x /usr/bin/sandbox-exec ]; then
+        exec /usr/bin/sandbox-exec -f "$SEATBELT_PROFILE" -D _HOME="$HOME" -D _CWD="$PWD" "$@"
+    fi
+    exec "$@"
+}
 
 if [ -n "$STDIN_FILE" ]; then
-    exec "$REAL_EXEC" "$@" < "$STDIN_FILE"
+    seatbelt_exec "$REAL_EXEC" "$@" < "$STDIN_FILE"
 fi
 
-exec "$REAL_EXEC" "$@"
+seatbelt_exec "$REAL_EXEC" "$@"

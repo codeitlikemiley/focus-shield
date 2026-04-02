@@ -54,6 +54,57 @@ enum AppRuleType: String, Codable, CaseIterable {
     }
 }
 
+// MARK: - Filesystem Policy
+
+enum FilesystemAccessType: String, Codable, CaseIterable, DatabaseValueConvertible {
+    case read
+    case write
+
+    var label: String {
+        switch self {
+        case .read:  "Read"
+        case .write: "Write"
+        }
+    }
+
+    var databaseValue: DatabaseValue { rawValue.databaseValue }
+    static func fromDatabaseValue(_ dbValue: DatabaseValue) -> FilesystemAccessType? {
+        guard let rawValue = String.fromDatabaseValue(dbValue) else { return nil }
+        return FilesystemAccessType(rawValue: rawValue)
+    }
+}
+
+enum FilesystemMode: String, Codable, CaseIterable, DatabaseValueConvertible {
+    case disabled
+    case blacklist
+    case whitelist
+
+    var label: String {
+        switch self {
+        case .disabled:  "Off"
+        case .blacklist: "Blacklist"
+        case .whitelist: "Whitelist"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .disabled:
+            return "Use baseline FocusShield protections only"
+        case .blacklist:
+            return "Block listed filesystem paths"
+        case .whitelist:
+            return "Allow listed filesystem paths only"
+        }
+    }
+
+    var databaseValue: DatabaseValue { rawValue.databaseValue }
+    static func fromDatabaseValue(_ dbValue: DatabaseValue) -> FilesystemMode? {
+        guard let rawValue = String.fromDatabaseValue(dbValue) else { return nil }
+        return FilesystemMode(rawValue: rawValue)
+    }
+}
+
 // MARK: - Domain Rule
 
 struct DomainRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
@@ -93,13 +144,22 @@ struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePersist
     var isBlocked: Bool             // block entire app / all CLI access?
     var filterMode: FilterMode      // .blacklist / .whitelist / legacy .inheritGlobal
     var isEnabled: Bool             // false = "unlinked" — rule stays in DB but enforcement skips it
+    /// When true, FocusShield skips generating a CLI proxy wrapper for this tool.
+    /// Use this for AI agents (Claude Code, Cursor, Aider…) that already provide their own
+    /// sandbox + HTTP proxy: avoids a double-proxy chain while NEFilter socket enforcement
+    /// stays fully active at zero extra overhead.
+    var hasSelfSandbox: Bool
+    var filesystemReadMode: FilesystemMode
+    var filesystemWriteMode: FilesystemMode
 
     static let databaseTableName = "app_rules"
 
     init(id: Int64? = nil, profileID: Int64, appName: String, bundleIdentifier: String,
          executablePath: String? = nil, ruleType: AppRuleType = .guiApp,
          isBlocked: Bool = false, filterMode: FilterMode = .blacklist,
-         isEnabled: Bool = true) {
+         isEnabled: Bool = true, hasSelfSandbox: Bool = false,
+         filesystemReadMode: FilesystemMode = .disabled,
+         filesystemWriteMode: FilesystemMode = .disabled) {
         self.id = id
         self.profileID = profileID
         self.appName = appName
@@ -109,11 +169,101 @@ struct AppRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePersist
         self.isBlocked = isBlocked
         self.filterMode = filterMode
         self.isEnabled = isEnabled
+        self.hasSelfSandbox = hasSelfSandbox
+        self.filesystemReadMode = filesystemReadMode
+        self.filesystemWriteMode = filesystemWriteMode
     }
 
     mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 
     var isCLI: Bool { ruleType == .cliTool }
+}
+
+// MARK: - Known Self-Sandboxed AI Agents
+
+/// AI agent CLI tools that manage their own sandbox + HTTP proxy.
+/// Adding one of these pre-sets `hasSelfSandbox = true` so FocusShield
+/// skips the proxy wrapper while keeping NEFilter socket enforcement.
+enum KnownSandboxedAgent: String, CaseIterable, Identifiable {
+    case claudeCode = "claude"
+    case cursor     = "cursor"
+    case codex      = "codex"
+    case aider      = "aider"
+    case copilot    = "gh"      // GitHub Copilot CLI
+    case windsurf   = "windsurf"
+    case cline      = "cline"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .claudeCode: return "Claude Code"
+        case .cursor:     return "Cursor"
+        case .codex:      return "OpenAI Codex CLI"
+        case .aider:      return "Aider"
+        case .copilot:    return "GitHub Copilot CLI"
+        case .windsurf:   return "Windsurf"
+        case .cline:      return "Cline"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .claudeCode: return "sparkle"
+        case .cursor:     return "cursorarrow.rays"
+        case .codex:      return "cpu"
+        case .aider:      return "brain"
+        case .copilot:    return "airplane"
+        case .windsurf:   return "wind"
+        case .cline:      return "terminal.fill"
+        }
+    }
+
+    /// Common install paths — first match wins; falls back to PATH resolution.
+    var candidatePaths: [String] {
+        switch self {
+        case .claudeCode:
+            return ["/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
+        case .cursor:
+            return ["/usr/local/bin/cursor", "/Applications/Cursor.app/Contents/MacOS/Cursor"]
+        case .codex:
+            return ["/usr/local/bin/codex", "/opt/homebrew/bin/codex"]
+        case .aider:
+            return ["/usr/local/bin/aider", "/opt/homebrew/bin/aider"]
+        case .copilot:
+            return ["/usr/local/bin/gh", "/opt/homebrew/bin/gh"]
+        case .windsurf:
+            return ["/usr/local/bin/windsurf", "/Applications/Windsurf.app/Contents/MacOS/Windsurf"]
+        case .cline:
+            return ["/usr/local/bin/cline"]
+        }
+    }
+
+    /// Returns the first path that exists on disk, or the bare command name as fallback.
+    var resolvedPath: String {
+        let fm = FileManager.default
+        if let found = candidatePaths.first(where: { fm.isExecutableFile(atPath: $0) }) { return found }
+        // Try PATH
+        if let fromPath = CLIPathResolver.resolve(rawValue) { return fromPath }
+        return rawValue
+    }
+
+    /// Builds an AppRule ready to insert for a given profile.
+    func makeRule(profileID: Int64, filterMode: FilterMode = .whitelist) -> AppRule {
+        AppRule(
+            profileID: profileID,
+            appName: displayName,
+            bundleIdentifier: "cli.\(rawValue)",
+            executablePath: resolvedPath,
+            ruleType: .cliTool,
+            isBlocked: false,
+            filterMode: filterMode,
+            isEnabled: true,
+            hasSelfSandbox: true,
+            filesystemReadMode: .disabled,
+            filesystemWriteMode: .disabled
+        )
+    }
 }
 
 // MARK: - Block Profile
@@ -243,6 +393,7 @@ struct AppRuleWithDomains: Identifiable {
     var id: Int64? { rule.id }
     var rule: AppRule
     var domainRules: [DomainRule]
+    var filesystemPathRules: [FilesystemPathRule]
 
     /// Resolve legacy `inheritGlobal` rows to blacklist after global website enforcement removal.
     func effectiveFilterMode(globalMode: FilterMode) -> FilterMode {
@@ -268,6 +419,20 @@ struct AppRuleWithDomains: Identifiable {
 
     func domainCount(for mode: FilterMode) -> Int {
         domainRules(for: mode).count
+    }
+
+    func filesystemPathRules(for accessType: FilesystemAccessType) -> [FilesystemPathRule] {
+        filesystemPathRules
+            .filter { $0.accessType == accessType }
+            .sorted { lhs, rhs in
+                lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+            }
+    }
+
+    var hasFilesystemPolicy: Bool {
+        rule.filesystemReadMode != .disabled
+            || rule.filesystemWriteMode != .disabled
+            || filesystemPathRules.contains(where: \.isEnabled)
     }
 }
 
@@ -392,6 +557,8 @@ struct ProfileNetworkPolicy {
     let cliRules: [CLINetworkRule]       // per-CLI pf rules
     let blockedAppBundleIDs: Set<String> // fully-blocked GUI apps
     let blockedCLIPaths: Set<String>     // fully-blocked CLI executables
+    /// Char-scan env vars to inject into every CLI wrapper for this profile.
+    let charScanEnv: [String: String]
 
     struct AppDomainOverride {
         let bundleID: String
@@ -404,6 +571,13 @@ struct ProfileNetworkPolicy {
         let isFullyBlocked: Bool
         let filterMode: FilterMode       // actual mode (never inheritGlobal here)
         let domains: [String]
+        /// When true, this tool manages its own sandbox + proxy.
+        /// `buildCLIWrappers` skips wrapper generation; NEFilter still enforces domain rules.
+        let hasSelfSandbox: Bool
+        let filesystemReadMode: FilesystemMode
+        let filesystemWriteMode: FilesystemMode
+        let readPaths: [String]
+        let writePaths: [String]
     }
 }
 
@@ -448,7 +622,7 @@ struct ProfileWithRules {
     }
 
     /// Build the full network policy for enforcement layers
-    func computeNetworkPolicy() -> ProfileNetworkPolicy {
+    func computeNetworkPolicy(charScanEnv: [String: String] = [:]) -> ProfileNetworkPolicy {
         let globalDomains: [String] = []
 
         let appOverrides: [ProfileNetworkPolicy.AppDomainOverride] = guiAppRules
@@ -475,7 +649,12 @@ struct ProfileWithRules {
                     executablePath: path,
                     isFullyBlocked: cliRule.rule.isBlocked,
                     filterMode: mode,
-                    domains: domains
+                    domains: domains,
+                    hasSelfSandbox: cliRule.rule.hasSelfSandbox,
+                    filesystemReadMode: cliRule.rule.filesystemReadMode,
+                    filesystemWriteMode: cliRule.rule.filesystemWriteMode,
+                    readPaths: cliRule.filesystemPathRules(for: .read).filter(\.isEnabled).map(\.path),
+                    writePaths: cliRule.filesystemPathRules(for: .write).filter(\.isEnabled).map(\.path)
                 )
             }
 
@@ -490,9 +669,36 @@ struct ProfileWithRules {
             appDomainOverrides: appOverrides,
             cliRules: cliNetworkRules,
             blockedAppBundleIDs: blockedAppBundleIDs,
-            blockedCLIPaths: blockedCLIPaths
+            blockedCLIPaths: blockedCLIPaths,
+            charScanEnv: charScanEnv
         )
     }
+}
+
+struct FilesystemPathRule: Identifiable, Codable, Hashable, FetchableRecord, MutablePersistableRecord {
+    var id: Int64?
+    var appRuleID: Int64
+    var accessType: FilesystemAccessType
+    var path: String
+    var isEnabled: Bool
+
+    static let databaseTableName = "filesystem_path_rules"
+
+    init(
+        id: Int64? = nil,
+        appRuleID: Int64,
+        accessType: FilesystemAccessType,
+        path: String,
+        isEnabled: Bool = true
+    ) {
+        self.id = id
+        self.appRuleID = appRuleID
+        self.accessType = accessType
+        self.path = path
+        self.isEnabled = isEnabled
+    }
+
+    mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }
 
 // MARK: - Payload Protection
@@ -596,6 +802,82 @@ enum PayloadProtectionDefaults {
         ("IPv6 Address", #"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b"#),
         ("MAC Address", #"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"#),
     ]
+}
+
+// MARK: - Invisible Character Scan Policy (per profile)
+
+/// Defines which categories of dangerous/invisible Unicode characters to block
+/// for CLI payloads in this profile. One row per profile in `profile_char_policies`.
+struct ProfileCharPolicy: Codable, FetchableRecord, PersistableRecord, Equatable {
+    /// Foreign key — also the primary key (one-to-one with BlockProfile).
+    var profileID: Int64
+    /// Zero-width characters: U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+FEFF BOM,
+    /// U+2060 Word Joiner, U+FFFC Object Replacement Character, etc.
+    var zeroWidthBlock: Bool
+    /// RTL override / embedding: U+202A-202E, U+2066-2069 — used to spoof text direction.
+    var rtlOverrideBlock: Bool
+    /// Invisible tag plane: U+E0001-U+E007F — frequently used in AI prompt injection.
+    var tagCharBlock: Bool
+    /// Invisible format characters: U+00AD soft hyphen, U+115F/U+1160 Hangul fillers,
+    /// U+3164 Hangul filler, U+17B4/17B5, variation selectors U+FE00-FE0F, etc.
+    var invisibleFormatBlock: Bool
+    /// Alert when Cyrillic/Greek characters that visually resemble ASCII letters are detected.
+    var homoglyphAlert: Bool
+    /// Master switch — when false the scanner is skipped entirely for this profile.
+    var isEnabled: Bool
+
+    static let databaseTableName = "profile_char_policies"
+
+    init(
+        profileID: Int64,
+        zeroWidthBlock: Bool = false,
+        rtlOverrideBlock: Bool = false,
+        tagCharBlock: Bool = false,
+        invisibleFormatBlock: Bool = false,
+        homoglyphAlert: Bool = false,
+        isEnabled: Bool = false
+    ) {
+        self.profileID = profileID
+        self.zeroWidthBlock = zeroWidthBlock
+        self.rtlOverrideBlock = rtlOverrideBlock
+        self.tagCharBlock = tagCharBlock
+        self.invisibleFormatBlock = invisibleFormatBlock
+        self.homoglyphAlert = homoglyphAlert
+        self.isEnabled = isEnabled
+    }
+
+    /// Returns a default (all-off) policy for the given profile.
+    static func defaultPolicy(profileID: Int64) -> ProfileCharPolicy {
+        ProfileCharPolicy(profileID: profileID)
+    }
+
+    /// Environment variables to inject into CLI wrapper processes.
+    /// When `isEnabled` is false all vars are omitted / set to 0 for fast short-circuit.
+    var cliEnv: [String: String] {
+        guard isEnabled else {
+            return ["FOCUSSHIELD_CHARSCAN_ENABLED": "0"]
+        }
+        return [
+            "FOCUSSHIELD_CHARSCAN_ENABLED":   "1",
+            "FOCUSSHIELD_CHARSCAN_ZWSP":      zeroWidthBlock       ? "1" : "0",
+            "FOCUSSHIELD_CHARSCAN_RTL":       rtlOverrideBlock     ? "1" : "0",
+            "FOCUSSHIELD_CHARSCAN_TAGS":      tagCharBlock         ? "1" : "0",
+            "FOCUSSHIELD_CHARSCAN_INVIS":     invisibleFormatBlock ? "1" : "0",
+            "FOCUSSHIELD_CHARSCAN_HOMOGLYPH": homoglyphAlert       ? "1" : "0",
+        ]
+    }
+
+    /// Human-readable summary of active categories (for UI status lines).
+    var activeCategoryLabels: [String] {
+        guard isEnabled else { return [] }
+        var labels: [String] = []
+        if zeroWidthBlock       { labels.append("Zero-Width") }
+        if rtlOverrideBlock     { labels.append("RTL Override") }
+        if tagCharBlock         { labels.append("Tag Chars") }
+        if invisibleFormatBlock { labels.append("Invisible Format") }
+        if homoglyphAlert       { labels.append("Homoglyphs") }
+        return labels
+    }
 }
 
 // MARK: - System Safelist (always allowed in whitelist mode)

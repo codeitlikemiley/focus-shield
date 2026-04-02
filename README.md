@@ -13,6 +13,7 @@ A native **SwiftUI** app for **macOS** and **iOS** that blocks distracting websi
 | **App blocking** | ✅ Network Extension + process termination + pf | ✅ via Screen Time API |
 | **CLI Tool blocking** | ✅ wrapper + preflight guard + network backstop | — |
 | **CLI Payload Guard** | ✅ regex-based prompt/deny for configured CLI tools | — |
+| **CLI filesystem policy** | ✅ Seatbelt-backed read/write allowlist + denylist per tool | — |
 | **On-demand domain add** | ✅ `l=w` / `l=b` env var inline with any command | — |
 | **Profiles** | ✅ Unlimited custom profiles | ✅ |
 | **Global / Per-App / Per-CLI Rules** | ✅ | — |
@@ -119,6 +120,7 @@ Focus Shield has a **control plane** and multiple **enforcement layers**. The Ne
 | **pf firewall** | Transport backstop | IP-level blocking for TCP and UDP, including QUIC/HTTP/3 bypass attempts |
 | **App monitor** | Fully blocked GUI apps | Watches launches and terminates apps that are configured as fully blocked |
 | **CLI wrappers + guard** | Linked CLI tools | Wrapper scripts inspect command args/stdin/files, enforce domain mode, and optionally prompt on sensitive payloads before exec |
+| **CLI Seatbelt sandbox** | Linked CLI tools | Per-tool filesystem read/write policy compiled into `sandbox-exec` profiles at final exec time |
 
 ### Why both Network Extension and legacy layers?
 
@@ -198,7 +200,17 @@ CLI tools use a different path than GUI apps because a terminal command exposes 
 CLI tools therefore have **two layers of protection**:
 
 1. **Full block** (`isBlocked = true`): the wrapper exits immediately and the global network stack stays active as a backstop.
-2. **Preflight guard** (Whitelist/Blacklist + Payload Protection): the wrapper inspects visible destination hosts in command arguments/stdin/files, blocks disallowed hosts, and can prompt on sensitive payload regex matches before the command executes.
+2. **Preflight guard + filesystem sandbox**: the wrapper inspects visible destination hosts in command arguments/stdin/files, blocks disallowed hosts, can prompt on sensitive payload regex matches, and then executes the real binary under a Seatbelt profile with per-tool read/write rules.
+
+### CLI filesystem policy
+
+Each CLI rule now also has a filesystem section:
+
+- **Read mode**: `Off`, `Blacklist`, or `Whitelist`
+- **Write mode**: `Off`, `Blacklist`, or `Whitelist`
+- **Path lists**: stored separately for read and write operations
+
+FocusShield always keeps baseline protections in the generated Seatbelt profile for sensitive credential paths and shell persistence targets. When you enable whitelist/blacklist mode, the stored path lists are compiled into that same profile and enforced when the wrapped tool is launched.
 
 ### Example: Allow Claude Code to only access Anthropic
 
@@ -303,6 +315,19 @@ Still planned:
 - Browser and GUI-app payload interception before bytes leave the device
 - gRPC, WebSocket, SSH, and opaque TCP/UDP stream inspection
 - True per-app transport-aware filtering across protocols
+
+## Docker Comparison: Remaining Gaps
+
+Docker Sandboxes solve a different problem: they give an agent full control inside a microVM with a private Docker daemon, mounted workspaces, proxy-controlled egress, and optional read-only secondary mounts. FocusShield stays on the host and enforces policy there.
+
+What FocusShield still does **not** replicate from that model:
+
+- **MicroVM / host isolation**: the agent still runs on your real machine, not in a disposable VM
+- **Private Docker daemon isolation**: host Docker access is not carved into a separate daemon per agent
+- **Read-only secondary workspaces**: filesystem policy is per wrapped CLI tool, not per mounted workspace
+- **HTTP credential injection / proxy mediation for all traffic**: we enforce destinations and inspect wrapped CLI payloads, but we do not broker every request body for every process
+- **GUI app filesystem enforcement**: current filesystem policy is implemented for CLI wrappers; GUI-app file access would need Endpoint Security or a different privileged enforcement plane
+- **Unix socket / local IPC policy**: this remains outside the current rule model
 
 The remaining work requires extending the current Network Extension path beyond host-based decisions, and it remains bounded by Apple's Network Extension APIs.
 

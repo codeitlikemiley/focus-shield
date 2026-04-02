@@ -24,7 +24,7 @@ struct CLIRulesTab: View {
             // Info bar
             HStack {
                 Image(systemName: "info.circle").foregroundStyle(.blue).font(.system(size: 12))
-                Text("CLI rules now run through a wrapper preflight that can reject visible destination hosts and sensitive payloads before the command executes. Commands that hide their network targets internally still need the future transport-aware engine for full coverage.")
+                Text("CLI rules run through a wrapper preflight that inspects destinations and payloads. AI agents with “Self-Sandboxed” skip the proxy wrapper — their own sandbox handles it. NEFilter socket enforcement applies to all tools.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -38,6 +38,14 @@ struct CLIRulesTab: View {
 
             Divider()
 
+            // Reader tools auto-protection banner
+            // Shown only when payload protection is ON so users see what's happening
+            // even though they didn't add cat/grep/head as explicit CLI rules.
+            if vm.settings.payloadProtectionEnabled {
+                readerToolsBanner
+                Divider()
+            }
+
             if (profileWithRules?.cliRules ?? []).isEmpty {
                 emptyState
             } else {
@@ -48,10 +56,26 @@ struct CLIRulesTab: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    showAddCLI = true
-                } label: {
-                    Label("Add CLI", systemImage: "plus")
+                HStack(spacing: 6) {
+                    // Quick-add a known AI agent (pre-sets hasSelfSandbox = true)
+                    Menu {
+                        ForEach(KnownSandboxedAgent.allCases) { agent in
+                            Button {
+                                vm.addAgentRule(profileID: profileID, agent: agent)
+                            } label: {
+                                Label(agent.displayName, systemImage: agent.icon)
+                            }
+                        }
+                    } label: {
+                        Label("Add AI Agent", systemImage: "sparkle")
+                    }
+                    .help("Add a known AI agent with Self-Sandboxed mode pre-configured")
+
+                    Button {
+                        showAddCLI = true
+                    } label: {
+                        Label("Add CLI", systemImage: "plus")
+                    }
                 }
             }
         }
@@ -76,6 +100,78 @@ struct CLIRulesTab: View {
             profileWithRules = vm.fetchProfileWithRules(id: newValue)
         }
     }
+
+    // MARK: - Reader tools auto-protection banner
+
+    private static let readerTools: [(name: String, path: String)] = [
+        ("cat",     "/bin/cat"),
+        ("head",    "/usr/bin/head"),
+        ("tail",    "/usr/bin/tail"),
+        ("grep",    "/usr/bin/grep"),
+        ("awk",     "/usr/bin/awk"),
+        ("sed",     "/usr/bin/sed"),
+        ("strings", "/usr/bin/strings"),
+    ]
+
+    private var readerToolsBanner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "shield.lefthalf.filled")
+                .foregroundStyle(.green)
+                .font(.system(size: 13))
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 5) {
+                    Text("Auto-protected reader tools")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text("Payload Scanner")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.8), in: Capsule())
+                }
+
+                Text("These tools are automatically wrapped with the lightweight payload scanner while Payload Protection is on. No rule needed — credentials and invisible Unicode are scanned in every file read and pipe.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Tool pills — horizontally scrollable row
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        ForEach(Self.readerTools, id: \.name) { tool in
+                            HStack(spacing: 3) {
+                                Image(systemName: "terminal.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.green.opacity(0.8))
+                                Text(tool.name)
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                Text(tool.path)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.green.opacity(0.2), lineWidth: 0.5))
+                        }
+                    }
+                }
+
+                Text("Turn off in Settings → Payload Protection.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.green.opacity(0.04))
+    }
+
+    // MARK: - Search bar
 
     private var searchBar: some View {
         HStack {
@@ -120,6 +216,13 @@ struct CLIRulesTab: View {
                         .foregroundStyle(.secondary)
                 }
                 .padding(.leading, 16)
+
+                FilesystemPolicyEditorView(
+                    profileID: profileID,
+                    cliRule: cliRule
+                )
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
 
                 RuleDomainEditorView(
                     profileID: profileID,
@@ -200,6 +303,7 @@ struct CLIRuleHeaderRow: View {
     let onImport: () -> Void
 
     private var isLinked: Bool { cliRule.rule.isEnabled }
+    private var isSelfSandboxed: Bool { cliRule.rule.hasSelfSandbox }
 
     var body: some View {
         HStack(spacing: 4) {
@@ -212,14 +316,27 @@ struct CLIRuleHeaderRow: View {
             }
             .buttonStyle(.plain)
 
-            Image(systemName: "terminal.fill")
-                .foregroundStyle(isLinked ? (cliRule.rule.isBlocked ? .red : .purple) : .gray)
+            Image(systemName: isSelfSandboxed ? "bubblefill.and.magnifyingglass" : "terminal.fill")
+                .foregroundStyle(isLinked ? (cliRule.rule.isBlocked ? .red : (isSelfSandboxed ? .indigo : .purple)) : .gray)
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(cliRule.rule.appName)
-                    .font(.system(.subheadline, design: .monospaced).weight(.medium))
-                    .foregroundStyle(isLinked ? .primary : .secondary)
+                HStack(spacing: 5) {
+                    Text(cliRule.rule.appName)
+                        .font(.system(.subheadline, design: .monospaced).weight(.medium))
+                        .foregroundStyle(isLinked ? .primary : .secondary)
+
+                    // Self-sandboxed badge
+                    if isSelfSandboxed {
+                        Text("Self-Sandboxed")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.indigo.opacity(0.85), in: Capsule())
+                            .help("This tool manages its own sandbox and proxy. FocusShield’s proxy wrapper is skipped to avoid double-proxy overhead. NEFilter socket enforcement is still fully active.")
+                    }
+                }
                 HStack(spacing: 4) {
                     if !isLinked {
                         Label("Disabled", systemImage: "link.badge.plus")
@@ -229,6 +346,10 @@ struct CLIRuleHeaderRow: View {
                         Label("All traffic blocked", systemImage: "stop.circle.fill")
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundStyle(.red)
+                    } else if isSelfSandboxed {
+                        Label("NEFilter enforced · no proxy wrapper", systemImage: "network.badge.shield.half.filled")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.indigo.opacity(0.8))
                     } else if !cliRule.domainRules.isEmpty {
                         let mode = cliRule.effectiveFilterMode(globalMode: .blacklist)
                         let activeCount = cliRule.domainCount(for: mode)
@@ -246,6 +367,27 @@ struct CLIRuleHeaderRow: View {
             }
 
             Spacer()
+
+            // Self-sandbox toggle (only for CLI tools, not blocked)
+            if !cliRule.rule.isBlocked {
+                Button {
+                    if let id = cliRule.rule.id {
+                        vm.toggleSelfSandbox(profileID: profileID, id: id,
+                                             hasSelfSandbox: !isSelfSandboxed)
+                    }
+                } label: {
+                    Image(systemName: isSelfSandboxed ? "bubblefill.and.magnifyingglass" : "bubble.and.magnifyingglass")
+                        .foregroundStyle(isSelfSandboxed ? Color.indigo : Color.secondary.opacity(0.6))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isSelfSandboxed
+                    ? "Self-Sandboxed: this agent’s own sandbox handles proxy and filesystem. Click to revert to standard FocusShield wrapper."
+                    : "Enable Self-Sandboxed mode: skip proxy wrapper for tools that manage their own sandbox (e.g. Claude Code, Cursor).")
+                .disabled(!isLinked)
+                .opacity(isLinked ? 1 : 0.4)
+            }
 
             if cliRule.rule.isBlocked {
                 Button("Unblock") {
@@ -307,6 +449,250 @@ struct CLIRuleHeaderRow: View {
             .buttonStyle(.plain)
         }
         .opacity(isLinked ? 1 : 0.7)
+    }
+}
+
+// MARK: - Filesystem Policy Editor
+
+struct FilesystemPolicyEditorView: View {
+    @Environment(FocusShieldViewModel.self) private var vm
+    let profileID: Int64
+    let cliRule: AppRuleWithDomains
+
+    private var ruleID: Int64? { cliRule.rule.id }
+    private var readRules: [FilesystemPathRule] { cliRule.filesystemPathRules(for: .read) }
+    private var writeRules: [FilesystemPathRule] { cliRule.filesystemPathRules(for: .write) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Label("Filesystem", systemImage: "externaldrive.badge.timemachine")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                if cliRule.hasFilesystemPolicy {
+                    Text("Seatbelt enforced")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.green)
+                } else {
+                    Text("Baseline protection only")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Text("CLI-only enforcement. FocusShield applies these rules when the wrapped tool is executed; GUI app filesystem control still needs a separate enforcement plane.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 12) {
+                filesystemModePicker(
+                    title: "Read",
+                    accessType: .read,
+                    selection: cliRule.rule.filesystemReadMode
+                )
+                filesystemModePicker(
+                    title: "Write",
+                    accessType: .write,
+                    selection: cliRule.rule.filesystemWriteMode
+                )
+            }
+
+            FilesystemPathListEditor(
+                profileID: profileID,
+                appRuleID: ruleID,
+                accessType: .read,
+                mode: cliRule.rule.filesystemReadMode,
+                rules: readRules
+            )
+
+            FilesystemPathListEditor(
+                profileID: profileID,
+                appRuleID: ruleID,
+                accessType: .write,
+                mode: cliRule.rule.filesystemWriteMode,
+                rules: writeRules
+            )
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    @ViewBuilder
+    private func filesystemModePicker(
+        title: String,
+        accessType: FilesystemAccessType,
+        selection: FilesystemMode
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(title) mode")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Picker(title, selection: Binding(
+                get: { selection },
+                set: { newValue in
+                    guard let ruleID else { return }
+                    vm.setFilesystemMode(
+                        profileID: profileID,
+                        id: ruleID,
+                        accessType: accessType,
+                        mode: newValue
+                    )
+                }
+            )) {
+                ForEach(FilesystemMode.allCases, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(ruleID == nil)
+
+            Text(selection.description)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct FilesystemPathListEditor: View {
+    @Environment(FocusShieldViewModel.self) private var vm
+    let profileID: Int64
+    let appRuleID: Int64?
+    let accessType: FilesystemAccessType
+    let mode: FilesystemMode
+    let rules: [FilesystemPathRule]
+
+    @State private var newPath = ""
+
+    private var title: String { "\(accessType.label) paths" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+                Text(modeSummary)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            if rules.isEmpty {
+                Text(emptyStateText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(rules) { rule in
+                        FilesystemPathRow(
+                            profileID: profileID,
+                            rule: rule
+                        )
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                TextField(pathPlaceholder, text: $newPath)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .disabled(appRuleID == nil)
+                Button("Add") {
+                    guard let appRuleID else { return }
+                    vm.addFilesystemPathRule(
+                        profileID: profileID,
+                        appRuleID: appRuleID,
+                        accessType: accessType,
+                        path: newPath
+                    )
+                    newPath = ""
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(appRuleID == nil || newPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    private var modeSummary: String {
+        switch mode {
+        case .disabled:
+            return "Stored only"
+        case .blacklist:
+            return "Blocked by these paths"
+        case .whitelist:
+            return "Allowed by these paths"
+        }
+    }
+
+    private var emptyStateText: String {
+        switch mode {
+        case .disabled:
+            return "No stored paths. Baseline FocusShield secret and persistence protections still apply."
+        case .blacklist:
+            return "Add paths this tool must not \(accessType == .read ? "read" : "write")."
+        case .whitelist:
+            return "Add paths this tool is allowed to \(accessType == .read ? "read" : "write") in addition to the current working directory and system paths."
+        }
+    }
+
+    private var pathPlaceholder: String {
+        switch accessType {
+        case .read:
+            return "~/Secrets or /Volumes/Archive"
+        case .write:
+            return "~/Desktop/export or /tmp/build"
+        }
+    }
+}
+
+struct FilesystemPathRow: View {
+    @Environment(FocusShieldViewModel.self) private var vm
+    let profileID: Int64
+    let rule: FilesystemPathRule
+
+    @State private var draftPath: String
+
+    init(profileID: Int64, rule: FilesystemPathRule) {
+        self.profileID = profileID
+        self.rule = rule
+        _draftPath = State(initialValue: rule.path)
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Toggle("", isOn: Binding(
+                get: { rule.isEnabled },
+                set: { isEnabled in
+                    guard let id = rule.id else { return }
+                    vm.toggleFilesystemPathRule(profileID: profileID, id: id, enabled: isEnabled)
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+
+            TextField("Path", text: $draftPath)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+                .onSubmit {
+                    guard let id = rule.id else { return }
+                    vm.updateFilesystemPathRule(profileID: profileID, id: id, path: draftPath)
+                }
+
+            Button("Save") {
+                guard let id = rule.id else { return }
+                vm.updateFilesystemPathRule(profileID: profileID, id: id, path: draftPath)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button(role: .destructive) {
+                guard let id = rule.id else { return }
+                vm.removeFilesystemPathRule(profileID: profileID, id: id)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.plain)
+        }
     }
 }
 
@@ -589,4 +975,3 @@ struct AddCLIRuleSheet: View {
         }
     }
 }
-
