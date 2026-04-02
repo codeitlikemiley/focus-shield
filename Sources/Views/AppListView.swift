@@ -336,6 +336,21 @@ struct AppRuleHeaderRow: View {
 
             Spacer()
 
+            // ── Enable / Disable toggle ──────────────────────────────────
+            Toggle("", isOn: Binding(
+                get: { appRule.rule.isEnabled },
+                set: { newValue in
+                    if let id = appRule.rule.id {
+                        vm.toggleAppEnabled(profileID: profileID, id: id, enabled: newValue)
+                    }
+                }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .labelsHidden()
+            .tint(.green)
+            .help(appRule.rule.isEnabled ? "Disable rule (keeps domain list intact)" : "Enable rule")
+
             if appRule.rule.isBlocked {
                 Button("Unblock") {
                     if let id = appRule.rule.id {

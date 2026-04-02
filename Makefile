@@ -96,6 +96,7 @@ scripts:
 	bash -n install.sh
 	bash -n update_aliases.sh
 	bash -n focusshield-cli-guard.sh
+	bash -n focusshield-payload-scanner.sh
 
 verify: build scripts
 
@@ -155,6 +156,7 @@ diagnose:
 	@printf "  Sudoers file:    "; [ -f /etc/sudoers.d/focusshield ] && echo "✅ Present" || echo "❌ Missing"
 	@printf "  Alias manager:   "; [ -f /usr/local/lib/focusshield/update_aliases.sh ] && echo "✅ Present" || echo "❌ Missing"
 	@printf "  CLI guard:       "; [ -f /usr/local/lib/focusshield/focusshield-cli-guard ] && echo "✅ Present" || echo "❌ Missing"
+	@printf "  Payload scanner: "; [ -f /usr/local/lib/focusshield/focusshield-payload-scanner ] && echo "✅ Present" || echo "❌ Missing"
 	@printf "  DNS proxy:       "; [ -f /usr/local/bin/focusshield-dns ] && echo "✅ Present" || echo "❌ Missing"
 	@echo ""
 	@echo "── Network Extension ──"

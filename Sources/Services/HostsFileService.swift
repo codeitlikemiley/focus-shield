@@ -30,6 +30,7 @@ enum HostsFileService {
     private static let supportScriptsDir = "/usr/local/lib/focusshield"
     private static let aliasManagerPath = "\(supportScriptsDir)/update_aliases.sh"
     private static let payloadGuardPath = "\(supportScriptsDir)/focusshield-cli-guard"
+    private static let payloadScannerPath = "\(supportScriptsDir)/focusshield-payload-scanner"
     private static let managedPreferencesDir = "/Library/Managed Preferences"
     private static let firefoxManagedPolicyPath = "/Library/Application Support/Mozilla/managed-policies.json"
 
@@ -343,15 +344,15 @@ enum HostsFileService {
             .map { "export \($0.key)=\"\($0.value)\"" }
             .joined(separator: "\n")
 
-        // Tools used internally by the CLI guard script itself. Wrapping any of these
-        // would cause the guard to call its own wrapper → infinite recursion / fork bomb.
-        // Also block shells, make, and other build tools that launch sub-processes.
+        // Tools used internally by focusshield-cli-guard. Never give these the full
+        // guard wrapper — doing so causes guard → wrapper → guard recursion (fork bomb).
+        // Note: cat/head/grep/awk/sed are NOT here — they get the lightweight scanner instead.
         let neverWrapTools: Set<String> = [
-            // Used directly inside focusshield-cli-guard
-            "cat", "head", "grep", "awk", "perl", "shasum", "sha256sum",
-            "mktemp", "sort", "sed", "wc", "rm", "mkdir", "touch", "basename",
+            // Guard internals (NOT reader tools — those go to lightweight scanner)
+            "perl", "shasum", "sha256sum",
+            "mktemp", "sort", "wc", "rm", "mkdir", "touch", "basename",
             "printf", "echo", "base64", "sqlite3", "osascript",
-            // Shells — wrapping these breaks every new terminal / sub-shell
+            // Shells — wrapping breaks every new terminal / sub-shell
             "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
             // Build tools whose subprocesses inherit PATH
             "make", "gmake", "ninja", "cmake", "xcodebuild",
@@ -359,15 +360,90 @@ enum HostsFileService {
             "sudo", "su", "env", "exec", "open", "launchctl",
         ]
 
+        // Reader tools: get the lightweight payload scanner (focusshield-payload-scanner)
+        // instead of the full guard. The lightweight scanner uses ONLY perl/mktemp/osascript/shasum
+        // internally — never cat/grep/awk/head/sed — so there is zero recursion risk.
+        // Map: tool name → real system executable path
+        let readerToolPaths: [(name: String, path: String)] = [
+            ("cat",     "/bin/cat"),
+            ("head",    "/usr/bin/head"),
+            ("tail",    "/usr/bin/tail"),
+            ("grep",    "/usr/bin/grep"),
+            ("awk",     "/usr/bin/awk"),
+            ("sed",     "/usr/bin/sed"),
+            ("strings", "/usr/bin/strings"),
+        ]
+        let readerToolNames = Set(readerToolPaths.map { $0.name })
+
         var wroteAny = false
+
+        // ── Auto-inject lightweight scanner wrappers for reader tools ─────────────
+        // When payload protection is on, reader tools (cat, grep, head, etc.) get
+        // wrapped with the lightweight scanner — NOT the full guard — to avoid fork bombs.
+        // This runs regardless of whether the user added these tools as explicit CLI rules.
+        if payloadProtectionEnabled {
+            let alreadyConfiguredReaders = Set(cliRules.compactMap { rule -> String? in
+                let name = (rule.executablePath as NSString).lastPathComponent
+                return readerToolNames.contains(name) ? name : nil
+            })
+            for (toolName, execPath) in readerToolPaths where !alreadyConfiguredReaders.contains(toolName) {
+                let content = readerToolWrapperContent(
+                    toolName: toolName, execPath: execPath,
+                    payloadProtectionEnabled: true,
+                    charScanExports: charScanExports,
+                    seatbeltProfilePath: ""
+                )
+                let wrapperFile = tmpDir.appendingPathComponent(toolName)
+                if (try? content.write(to: wrapperFile, atomically: true, encoding: .utf8)) != nil {
+                    wroteAny = true
+                }
+            }
+        }
+
+        // ── User-configured CLI rules ─────────────────────────────────────────────
         for rule in cliRules {
             let execPath = rule.executablePath
             guard !execPath.isEmpty else { continue }
 
             let toolName = (execPath as NSString).lastPathComponent
+            let seatbeltProfilePath: String = {
+                guard SeatbeltService.isAvailable else { return "" }
+                let profile = SeatbeltService.generateProfile(
+                    toolName: toolName,
+                    executablePath: execPath,
+                    readMode: rule.filesystemReadMode,
+                    writeMode: rule.filesystemWriteMode,
+                    readPaths: rule.readPaths,
+                    writePaths: rule.writePaths
+                )
+                return (try? SeatbeltService.writeProfile(profile, toolName: toolName))?.path ?? ""
+            }()
 
             // Never wrap guard-internal tools — doing so creates a fork bomb.
             if neverWrapTools.contains(toolName) { continue }
+
+            // Reader tools always use the lightweight scanner (not the full guard).
+            if readerToolNames.contains(toolName) {
+                if rule.isFullyBlocked {
+                    let content = blockedWrapperContent(toolName: toolName)
+                    let wrapperFile = tmpDir.appendingPathComponent(toolName)
+                    if (try? content.write(to: wrapperFile, atomically: true, encoding: .utf8)) != nil {
+                        wroteAny = true
+                    }
+                } else {
+                    let content = readerToolWrapperContent(
+                        toolName: toolName, execPath: execPath,
+                        payloadProtectionEnabled: payloadProtectionEnabled,
+                        charScanExports: charScanExports,
+                        seatbeltProfilePath: seatbeltProfilePath
+                    )
+                    let wrapperFile = tmpDir.appendingPathComponent(toolName)
+                    if (try? content.write(to: wrapperFile, atomically: true, encoding: .utf8)) != nil {
+                        wroteAny = true
+                    }
+                }
+                continue
+            }
 
             // Self-sandboxed agents (Claude Code, Cursor, Aider…) manage their own proxy
             // and filesystem sandbox. Skip the proxy wrapper so we don't chain two proxies.
@@ -382,12 +458,7 @@ enum HostsFileService {
 
             let wrapperContent: String
             if rule.isFullyBlocked {
-                wrapperContent = """
-#!/bin/sh
-# FocusShield: \(toolName) is blocked by the active profile.
-echo "focusshield: '\(toolName)' is blocked by the active FocusShield profile." >&2
-exit 1
-"""
+                wrapperContent = blockedWrapperContent(toolName: toolName)
             } else if needsGuard {
                 let pacURL = cliPACs[toolName].map { _ in PACServer.cliPACURL(tool: toolName) } ?? ""
                 wrapperContent = """
@@ -401,6 +472,7 @@ export FOCUSSHIELD_PAYLOAD_PATTERNS_FILE="\(PayloadProtectionService.patternsFil
 export FOCUSSHIELD_PAYLOAD_ALLOWLIST_FILE="\(PayloadProtectionService.permanentAllowlistPath)"
 export FOCUSSHIELD_PAYLOAD_SESSION_ALLOWLIST_FILE="\(PayloadProtectionService.sessionAllowlistPath)"
 export FOCUSSHIELD_LEGACY_PAC_URL="\(pacURL)"
+export FOCUSSHIELD_SEATBELT_PROFILE="\(seatbeltProfilePath)"
 \(charScanExports)
 
 if [ -x "\(payloadGuardPath)" ]; then
@@ -420,6 +492,46 @@ exec "\(execPath)" "$@"
         }
 
         return wroteAny ? tmpDir.path : nil
+    }
+
+    // MARK: - Wrapper content helpers
+
+    /// Wrapper script calling the lightweight payload scanner (for cat, grep, head, etc.)
+    /// The scanner uses only perl/mktemp/osascript/shasum — no cat/grep/awk inside, no recursion.
+    private static func readerToolWrapperContent(
+        toolName: String,
+        execPath: String,
+        payloadProtectionEnabled: Bool,
+        charScanExports: String,
+        seatbeltProfilePath: String
+    ) -> String {
+        """
+#!/bin/sh
+# FocusShield: \(toolName) lightweight payload scanner wrapper.
+export FOCUSSHIELD_TOOL_NAME="\(toolName)"
+export FOCUSSHIELD_PAYLOAD_PROTECTION="\(payloadProtectionEnabled ? "1" : "0")"
+export FOCUSSHIELD_PAYLOAD_PATTERNS_FILE="\(PayloadProtectionService.patternsFilePath)"
+export FOCUSSHIELD_PAYLOAD_ALLOWLIST_FILE="\(PayloadProtectionService.permanentAllowlistPath)"
+export FOCUSSHIELD_PAYLOAD_SESSION_ALLOWLIST_FILE="\(PayloadProtectionService.sessionAllowlistPath)"
+export FOCUSSHIELD_SEATBELT_PROFILE="\(seatbeltProfilePath)"
+\(charScanExports)
+
+if [ -x "\(payloadScannerPath)" ]; then
+    exec "\(payloadScannerPath)" "\(execPath)" "$@"
+fi
+
+exec "\(execPath)" "$@"
+"""
+    }
+
+    /// Wrapper script that hard-blocks a tool (exit 1) regardless of any scanner.
+    private static func blockedWrapperContent(toolName: String) -> String {
+        """
+#!/bin/sh
+# FocusShield: \(toolName) is blocked by the active profile.
+echo "focusshield: '\(toolName)' is blocked by the active FocusShield profile." >&2
+exit 1
+"""
     }
 
     @discardableResult
@@ -1166,6 +1278,7 @@ PAYLOAD_PROTECTION="${FOCUSSHIELD_PAYLOAD_PROTECTION:-0}"
 PATTERNS_FILE="${FOCUSSHIELD_PAYLOAD_PATTERNS_FILE:-}"
 ALLOWLIST_FILE="${FOCUSSHIELD_PAYLOAD_ALLOWLIST_FILE:-}"
 SESSION_ALLOWLIST_FILE="${FOCUSSHIELD_PAYLOAD_SESSION_ALLOWLIST_FILE:-}"
+SEATBELT_PROFILE="${FOCUSSHIELD_SEATBELT_PROFILE:-}"
 
 # ── On-demand domain-add via env vars ──
 FS_ONDEMAND_MODE=""
@@ -1227,7 +1340,7 @@ if [ ! -t 0 ]; then
     STDIN_FILE=$(/usr/bin/mktemp -t focusshield_stdin.XXXXXX)
     /bin/cat > "$STDIN_FILE"
     /bin/printf '\nstdin:\n' >> "$SCAN_FILE"
-    /usr/bin/head -c 262144 "$STDIN_FILE" >> "$SCAN_FILE" 2>/dev/null || true
+    /usr/bin/head -c 4194304 "$STDIN_FILE" >> "$SCAN_FILE" 2>/dev/null || true
     /bin/printf '\n' >> "$SCAN_FILE"
 fi
 
@@ -1411,11 +1524,18 @@ check_invisible_chars
 # Restore full PATH so the real tool runs in the user's environment
 export PATH="$_FS_SAVED_PATH"
 
+seatbelt_exec() {
+    if [ -n "$SEATBELT_PROFILE" ] && [ -f "$SEATBELT_PROFILE" ] && [ -x /usr/bin/sandbox-exec ]; then
+        exec /usr/bin/sandbox-exec -f "$SEATBELT_PROFILE" -D _HOME="$HOME" -D _CWD="$PWD" "$@"
+    fi
+    exec "$@"
+}
+
 if [ -n "$STDIN_FILE" ]; then
-    exec "$REAL_EXEC" "$@" < "$STDIN_FILE"
+    seatbelt_exec "$REAL_EXEC" "$@" < "$STDIN_FILE"
 fi
 
-exec "$REAL_EXEC" "$@"
+seatbelt_exec "$REAL_EXEC" "$@"
 """#
     }
 

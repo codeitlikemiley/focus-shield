@@ -278,6 +278,7 @@ WRAPPER_DIR="/usr/local/lib/focusshield/wrappers"
 SUPPORT_DIR="/usr/local/lib/focusshield"
 ALIAS_SCRIPT_SRC="$SCRIPT_DIR/update_aliases.sh"
 CLI_GUARD_SRC="$SCRIPT_DIR/focusshield-cli-guard.sh"
+PAYLOAD_SCANNER_SRC="$SCRIPT_DIR/focusshield-payload-scanner.sh"
 DOMAIN_ADD_SRC="$SCRIPT_DIR/focusshield-domain-add.sh"
 HELPER_TMP=$(mktemp)
 cat > "$HELPER_TMP" << 'HELPEREOF'
@@ -484,6 +485,15 @@ cp '$CLI_GUARD_SRC' '$SUPPORT_DIR/focusshield-cli-guard'
 chmod 755 '$SUPPORT_DIR/focusshield-cli-guard'
 chown root:wheel '$SUPPORT_DIR/focusshield-cli-guard'
 INSTALL_GUARD
+fi
+
+if [ -f "$PAYLOAD_SCANNER_SRC" ]; then
+    cat >> "$INSTALL_SCRIPT_TMP" << INSTALL_SCANNER
+# Step 2e: Install lightweight payload scanner (for cat, grep, head, awk, sed, tail)
+cp '$PAYLOAD_SCANNER_SRC' '$SUPPORT_DIR/focusshield-payload-scanner'
+chmod 755 '$SUPPORT_DIR/focusshield-payload-scanner'
+chown root:wheel '$SUPPORT_DIR/focusshield-payload-scanner'
+INSTALL_SCANNER
 fi
 
 if [ -f "$DOMAIN_ADD_SRC" ]; then
